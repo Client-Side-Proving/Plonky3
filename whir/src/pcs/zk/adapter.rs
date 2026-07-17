@@ -83,6 +83,20 @@ where
         ds.commit_statement_hvzk::<Challenger, DIGEST_ELEMS>(&self.config.inner);
         ds.add_zk_whir_proof::<Challenger, DIGEST_ELEMS>(&self.config);
     }
+
+    /// Builds the separator for a caller-bound relation and its external mask
+    /// groups, including the source commitment statement.
+    pub fn add_relation_domain_separator<const DIGEST_ELEMS: usize>(
+        &self,
+        ds: &mut DomainSeparator<EF, F>,
+        external_mask_groups: &[super::MaskGroupShape],
+    ) {
+        ds.commit_statement_hvzk::<Challenger, DIGEST_ELEMS>(&self.config.inner);
+        ds.add_zk_whir_relation_proof::<Challenger, DIGEST_ELEMS>(
+            &self.config,
+            external_mask_groups,
+        );
+    }
 }
 
 impl<EF, F, Dft, MT, Challenger, R> MultilinearPcs<EF, Challenger>
