@@ -13,6 +13,7 @@ use p3_sumcheck::zk::mask_residual_covectors_from_shape;
 
 use crate::pcs::zk::constraint::MaskClaims;
 use crate::pcs::zk::mask::{MaskCodeShape, MaskGroupShape};
+use crate::pcs::zk::relation::{CommittedMaskGroup, RelationError};
 
 /// Verifier-side mask state carried to the base case.
 ///
@@ -43,6 +44,23 @@ where
             groups: Vec::new(),
             commitments: Vec::new(),
         }
+    }
+
+    /// Starts from application-supplied mask groups whose commitments were
+    /// observed before the WHIR reduction began.
+    pub(super) fn from_external(
+        groups: Vec<CommittedMaskGroup<EF, MT::Commitment>>,
+    ) -> Result<Self, RelationError> {
+        let mut masks = Self::new();
+        for group in groups {
+            group.validate()?;
+            for covector in group.covectors {
+                masks.claims.push(covector);
+            }
+            masks.groups.push(group.shape);
+            masks.commitments.push(group.commitment);
+        }
+        Ok(masks)
     }
 
     /// Records one masked sumcheck batch.

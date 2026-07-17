@@ -27,13 +27,18 @@ use super::base_case::{BaseCaseZkConfig, BaseCaseZkError, BaseCaseZkVerifier};
 use super::code_switch::{CodeSwitchError, ZkMaskClaim, switch_mask_covector};
 use super::config::ZkWhirConfig;
 use super::constraint::SourceClaim;
-use super::proof::ZkWhirProof;
+use super::proof::{ZkWhirProof, ZkWhirRelationProof};
+use super::relation::{CommittedMaskGroup, CommittedRelation, RelationError};
 use crate::pcs::proof::QueryOpenings;
 use crate::pcs::utils::get_challenge_stir_queries;
 
 /// Failure modes of the HVZK-WHIR verifier.
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ZkVerifierError {
+    /// The caller supplied a malformed committed relation.
+    #[error(transparent)]
+    Relation(#[from] RelationError),
+
     /// A masked sumcheck batch failed to replay.
     #[error(transparent)]
     Sumcheck(#[from] SumcheckError),
@@ -147,31 +152,6 @@ where
         claims: &[(Point<EF>, EF)],
         challenger: &mut Challenger,
     ) -> Result<(), ZkVerifierError> {
-        let config = self.config;
-        let n_rounds = config.n_rounds();
-
-        // Structural checks before any transcript work.
-        if proof.rounds.len() != n_rounds {
-            return Err(ZkVerifierError::RoundCountMismatch {
-                expected: n_rounds,
-                actual: proof.rounds.len(),
-            });
-        }
-        // One sumcheck transcript and one interleaved mask commitment per
-        // batch; check each count on its own so the error names the culprit.
-        if proof.sumchecks.len() != n_rounds + 1 {
-            return Err(ZkVerifierError::SumcheckBatchCountMismatch {
-                expected: n_rounds + 1,
-                actual: proof.sumchecks.len(),
-            });
-        }
-        if proof.sumcheck_mask_commitments.len() != n_rounds + 1 {
-            return Err(ZkVerifierError::SumcheckBatchCountMismatch {
-                expected: n_rounds + 1,
-                actual: proof.sumcheck_mask_commitments.len(),
-            });
-        }
-
         // Reject malformed statements before any folding arithmetic runs.
         //
         //     point arity != committed arity  ->  error, never a panic
@@ -185,15 +165,59 @@ where
             }
         }
 
-        // Initial relation: claims batched by powers of alpha.
         let alpha: EF = challenger.sample_algebra_element();
-        let mut source = SourceClaim::new();
-        let mut target = EF::ZERO;
+        let mut relation = CommittedRelation::empty();
         for ((point, eval), coeff) in claims.iter().zip(alpha.powers()) {
-            source.push_eq(point.clone(), coeff);
-            target += coeff * *eval;
+            relation.source.push_eq(point.clone(), coeff);
+            relation.target += coeff * *eval;
         }
-        let mut masks = VerifierMasks::new();
+        self.verify_relation(
+            &proof.relation,
+            commitment,
+            relation,
+            Vec::new(),
+            challenger,
+        )
+    }
+
+    /// Verifies an already-bound committed relation with application-supplied
+    /// mask groups whose commitments were observed earlier in the transcript.
+    #[instrument(skip_all)]
+    #[allow(clippy::too_many_lines)]
+    pub fn verify_relation(
+        &self,
+        proof: &ZkWhirRelationProof<F, EF, MT>,
+        commitment: &MT::Commitment,
+        relation: CommittedRelation<EF>,
+        external_masks: Vec<CommittedMaskGroup<EF, MT::Commitment>>,
+        challenger: &mut Challenger,
+    ) -> Result<(), ZkVerifierError> {
+        let config = self.config;
+        let n_rounds = config.n_rounds();
+        relation.validate(config.num_variables)?;
+
+        if proof.rounds.len() != n_rounds {
+            return Err(ZkVerifierError::RoundCountMismatch {
+                expected: n_rounds,
+                actual: proof.rounds.len(),
+            });
+        }
+        if proof.sumchecks.len() != n_rounds + 1 {
+            return Err(ZkVerifierError::SumcheckBatchCountMismatch {
+                expected: n_rounds + 1,
+                actual: proof.sumchecks.len(),
+            });
+        }
+        if proof.sumcheck_mask_commitments.len() != n_rounds + 1 {
+            return Err(ZkVerifierError::SumcheckBatchCountMismatch {
+                expected: n_rounds + 1,
+                actual: proof.sumcheck_mask_commitments.len(),
+            });
+        }
+
+        let mut source = relation.source;
+        let mut target = relation.target;
+        let mut masks = VerifierMasks::from_external(external_masks)?;
 
         // Initial masked sumcheck batch.
         let mut randomness = self.replay_sumcheck_batch(
@@ -377,7 +401,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn replay_sumcheck_batch(
         &self,
-        proof: &ZkWhirProof<F, EF, MT>,
+        proof: &ZkWhirRelationProof<F, EF, MT>,
         batch: usize,
         folding: usize,
         pow_bits: usize,

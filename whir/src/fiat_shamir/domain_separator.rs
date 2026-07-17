@@ -8,7 +8,7 @@ use p3_field::{ExtensionField, Field, TwoAdicField};
 
 use crate::fiat_shamir::pattern::{Hint, Observe, Pattern, Sample};
 use crate::parameters::{FoldingFactor, WhirConfig};
-use crate::pcs::zk::ZkWhirConfig;
+use crate::pcs::zk::{MaskGroupShape, ZkWhirConfig};
 
 /// Configuration for a sumcheck phase in the protocol.
 #[derive(Debug)]
@@ -446,6 +446,40 @@ where
         EF: TwoAdicField,
         F: TwoAdicField,
     {
+        self.add_zk_whir_relation_inner::<Challenger, DIGEST_ELEMS>(config, &[], true);
+    }
+
+    /// Append an HVZK-WHIR proof for a relation already bound by the caller.
+    ///
+    /// Unlike the evaluation adapter, this form does not sample the initial
+    /// evaluation-batching challenge. External mask geometry is bound here and
+    /// carried through the same masked base case as WHIR's own masks.
+    pub fn add_zk_whir_relation_proof<Challenger, const DIGEST_ELEMS: usize>(
+        &mut self,
+        config: &ZkWhirConfig<EF, F, Challenger>,
+        external_mask_groups: &[MaskGroupShape],
+    ) where
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        EF: TwoAdicField,
+        F: TwoAdicField,
+    {
+        self.add_zk_whir_relation_inner::<Challenger, DIGEST_ELEMS>(
+            config,
+            external_mask_groups,
+            false,
+        );
+    }
+
+    fn add_zk_whir_relation_inner<Challenger, const DIGEST_ELEMS: usize>(
+        &mut self,
+        config: &ZkWhirConfig<EF, F, Challenger>,
+        external_mask_groups: &[MaskGroupShape],
+        sample_initial_combination: bool,
+    ) where
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        EF: TwoAdicField,
+        F: TwoAdicField,
+    {
         // Bind the ZK extension parameters.
         self.protocol_param(config.zk.ell_zk);
         self.protocol_param(config.mask_queries);
@@ -453,9 +487,19 @@ where
         for &budget in &config.oracle_randomness {
             self.protocol_param(budget);
         }
+        self.protocol_param(external_mask_groups.len());
+        for group in external_mask_groups {
+            self.protocol_param(group.shape.message_len);
+            self.protocol_param(group.shape.randomness_len);
+            self.protocol_param(group.shape.domain_size);
+            self.protocol_param(group.width);
+        }
 
-        // Claim batching challenge and the initial masked sumcheck batch.
-        self.sample(1, Sample::InitialCombinationRandomness);
+        // The evaluation adapter batches public claims here. A relation caller
+        // has already bound its scalar target and source terms.
+        if sample_initial_combination {
+            self.sample(1, Sample::InitialCombinationRandomness);
+        }
         self.add_zk_residual_sumcheck::<DIGEST_ELEMS>(&ZkSumcheckParams {
             rounds: config.round_folding_factor(0),
             pow_bits: config.starting_folding_pow_bits,
@@ -497,9 +541,12 @@ where
         let domain_size_bytes = ((folded_domain_size * 2 - 1).ilog2() as usize).div_ceil(8);
         let randomness_len = config.oracle_randomness[config.n_rounds()];
 
+        let mut mask_groups = external_mask_groups.to_vec();
+        mask_groups.extend(config.mask_groups());
+
         // Fresh main mask plus one fresh blind group per carried mask group.
         self.observe(DIGEST_ELEMS, Observe::MerkleDigest);
-        for _ in 0..config.mask_groups().len() {
+        for _ in 0..mask_groups.len() {
             self.observe(DIGEST_ELEMS, Observe::MerkleDigest);
         }
         self.observe(1, Observe::ZkBaseCaseClaim);
@@ -509,7 +556,7 @@ where
             (1 << final_config.num_variables) + randomness_len,
             Observe::ZkBaseCaseReveal,
         );
-        for group in config.mask_groups() {
+        for group in &mask_groups {
             for _ in 0..group.width {
                 self.observe(
                     group.shape.message_len + group.shape.randomness_len,
@@ -526,7 +573,7 @@ where
         );
         self.hint(Hint::StirAnswers);
         self.hint(Hint::MerkleProof);
-        for group in config.mask_groups() {
+        for group in &mask_groups {
             let mask_bytes = ((group.shape.domain_size * 2 - 1).ilog2() as usize).div_ceil(8);
             self.sample(config.mask_queries * mask_bytes, Sample::StirQueries);
             self.hint(Hint::StirAnswers);

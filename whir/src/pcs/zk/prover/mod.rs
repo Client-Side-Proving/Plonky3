@@ -28,7 +28,7 @@ use p3_sumcheck::product_polynomial::ProductPolynomial;
 use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
 use p3_sumcheck::zk::ZkSumcheckData;
 use p3_util::log2_strict_usize;
-use p3_zk_codes::ZkEncodingWithRandomness;
+use p3_zk_codes::{ZkEncoding, ZkEncodingWithRandomness};
 use rand::distr::{Distribution, StandardUniform};
 use rand::{Rng, RngExt};
 use tracing::instrument;
@@ -39,7 +39,10 @@ use crate::pcs::zk::base_case::{BaseCaseZkConfig, BaseCaseZkProver, MaskGroupWit
 use crate::pcs::zk::code_switch::{ZkMaskClaim, switch_mask_covector};
 use crate::pcs::zk::committer::{FoldedRsCode, zk_padded_matrix};
 use crate::pcs::zk::config::ZkWhirConfig;
-use crate::pcs::zk::proof::{ZkRoundProof, ZkWhirProof};
+use crate::pcs::zk::constraint::SourceTerm;
+use crate::pcs::zk::mask::MaskGroupShape;
+use crate::pcs::zk::proof::{ZkRoundProof, ZkWhirProof, ZkWhirRelationProof};
+use crate::pcs::zk::relation::{CommittedMaskGroupProverData, CommittedRelation, RelationError};
 use crate::utils::padded_ood_t1;
 
 /// HVZK-WHIR prover.
@@ -112,6 +115,52 @@ where
         )
     }
 
+    /// Commits one application-supplied group of extension-field masks.
+    ///
+    /// The commitment is observed immediately. The caller fills the returned
+    /// group's covectors once later transcript challenges define the relation.
+    pub fn commit_mask_group<R: Rng>(
+        &self,
+        shape: MaskGroupShape,
+        messages: Vec<Vec<EF>>,
+        challenger: &mut Challenger,
+        rng: &mut R,
+    ) -> Result<CommittedMaskGroupProverData<F, EF, MT>, RelationError> {
+        if messages.len() != shape.width {
+            return Err(RelationError::GroupWidthMismatch {
+                expected: shape.width,
+                actual: messages.len(),
+            });
+        }
+        for (mask, message) in messages.iter().enumerate() {
+            if message.len() != shape.shape.message_len {
+                return Err(RelationError::MessageLengthMismatch {
+                    mask,
+                    expected: shape.shape.message_len,
+                    actual: message.len(),
+                });
+            }
+        }
+
+        let encoding = shape.shape.encoding::<EF>();
+        let randomness: Vec<Vec<EF>> = messages
+            .iter()
+            .map(|_| encoding.sample_randomness(rng))
+            .collect();
+        let codewords = encoding.encode_batch_with_randomness(&messages, &randomness);
+        let (commitment, prover_data) = self.extension_mmcs.commit_matrix(codewords);
+        challenger.observe(commitment.clone());
+
+        Ok(CommittedMaskGroupProverData {
+            shape,
+            commitment,
+            messages,
+            randomness,
+            covectors: Vec::new(),
+            prover_data,
+        })
+    }
+
     /// Runs the full HVZK opening protocol for evaluation claims
     /// `f(point_i) = eval_i`.
     ///
@@ -125,23 +174,39 @@ where
         challenger: &mut Challenger,
         rng: &mut R,
     ) -> ZkWhirProof<F, EF, MT> {
+        let claimed_evals: Vec<EF> = claims.iter().map(|(_, eval)| *eval).collect();
+        let alpha: EF = challenger.sample_algebra_element();
+        let mut relation = CommittedRelation::empty();
+        for ((point, eval), coeff) in claims.iter().zip(alpha.powers()) {
+            relation.source.push_eq(point.clone(), coeff);
+            relation.target += coeff * *eval;
+        }
+        let relation = self
+            .prove_relation(prover_data, &relation, Vec::new(), challenger, rng)
+            .expect("adapter-built evaluation relation must be well formed");
+        ZkWhirProof {
+            evals: claimed_evals,
+            relation,
+        }
+    }
+
+    /// Proves an already-bound committed relation, carrying any application
+    /// mask groups through the existing WHIR reductions and masked base case.
+    #[instrument(skip_all)]
+    #[allow(clippy::too_many_lines)]
+    pub fn prove_relation<R: Rng>(
+        &self,
+        prover_data: HidingWhirProverData<F, EF, MT>,
+        relation: &CommittedRelation<EF>,
+        external_masks: Vec<CommittedMaskGroupProverData<F, EF, MT>>,
+        challenger: &mut Challenger,
+        rng: &mut R,
+    ) -> Result<ZkWhirRelationProof<F, EF, MT>, RelationError> {
         let config = self.config;
         let num_variables = config.num_variables;
+        relation.validate(num_variables)?;
         let sumcheck_mask_encoding = config.sumcheck_mask.encoding::<EF>();
-
-        // Claimed evaluations
-        let claimed_evals: Vec<EF> = claims.iter().map(|(_, eval)| *eval).collect();
-
-        // Initial relation: claims batched by powers of alpha.
-        //
-        //     W = sum_i alpha^i eq(z_i, .)        claim = sum_i alpha^i v_i
-        let alpha: EF = challenger.sample_algebra_element();
-        let coeffs: Vec<EF> = alpha.powers().collect_n(claims.len());
-        let mut claim = EF::ZERO;
-        for ((point, eval), coeff) in claims.iter().zip(&coeffs) {
-            assert_eq!(point.num_variables(), num_variables);
-            claim += *coeff * *eval;
-        }
+        let mut masks = ProverMasks::<F, EF, MT>::from_external(external_masks)?;
 
         // Build the weight and evaluation polynomials in SIMD-packed form
         // whenever the hypercube is large enough, mirroring the non-ZK
@@ -149,10 +214,18 @@ where
         // per-claim through the split-eq factorization instead of a full
         // 2^n scalar materialization.
         let k_pack = log2_strict_usize(F::Packing::WIDTH);
-        let product = if num_variables >= k_pack {
+        let all_eq = relation
+            .source
+            .constraints
+            .iter()
+            .all(|constraint| matches!(constraint.term, SourceTerm::Eq { .. }));
+        let product = if num_variables >= k_pack && all_eq {
             let mut weights = Poly::<EF::ExtensionPacking>::zero(num_variables - k_pack);
-            for ((point, _), &coeff) in claims.iter().zip(&coeffs) {
-                SplitEq::new_packed(point, coeff)
+            for constraint in &relation.source.constraints {
+                let SourceTerm::Eq { point } = &constraint.term else {
+                    unreachable!("all source terms were checked as Eq")
+                };
+                SplitEq::new_packed(point, constraint.coeff)
                     .accumulate_into_packed(weights.as_mut_slice(), None);
             }
             let evals = Poly::new(
@@ -163,10 +236,7 @@ where
             );
             ProductPolynomial::new_packed(VariableOrder::Prefix, evals, weights)
         } else {
-            let mut weights = Poly::<EF>::zero(num_variables);
-            for ((point, _), &coeff) in claims.iter().zip(&coeffs) {
-                SplitEq::new_unpacked(point, coeff).accumulate_into(weights.as_mut_slice(), None);
-            }
+            let weights = relation.source.materialize(num_variables);
             let evals = Poly::new(
                 prover_data
                     .message
@@ -177,10 +247,9 @@ where
             );
             ProductPolynomial::new_unpacked(VariableOrder::Prefix, evals, weights)
         };
-        let sumcheck_prover = SumcheckProver::new(product, claim);
+        let sumcheck_prover = SumcheckProver::new(product, relation.target - masks.aux);
 
         // Initial masked sumcheck batch.
-        let mut masks = ProverMasks::<F, EF, MT>::new();
         let mut zk_data = ZkSumcheckData::default();
         let handoff = sumcheck_prover.into_zk_sumcheck(
             &mut zk_data,
@@ -188,7 +257,7 @@ where
             &self.extension_mmcs,
             config.round_folding_factor(0),
             config.starting_folding_pow_bits,
-            EF::ZERO,
+            masks.aux,
             challenger,
             rng,
         );
@@ -202,7 +271,7 @@ where
             &mut sumcheck_mask_commitments,
             handoff,
             &mut zk_data,
-            config.zk.ell_zk,
+            config.sumcheck_mask,
         );
 
         // Current oracle state: message randomness folds along with the
@@ -421,6 +490,7 @@ where
                 mask_message,
                 mask_encoding_randomness,
                 mask_data,
+                *mask_shape,
             );
 
             rounds.push(ZkRoundProof {
@@ -451,7 +521,7 @@ where
                 &mut sumcheck_mask_commitments,
                 handoff,
                 &mut zk_data,
-                config.zk.ell_zk,
+                config.sumcheck_mask,
             );
 
             oracle_randomness =
@@ -468,7 +538,7 @@ where
         );
         let base_config = BaseCaseZkConfig {
             code: source_code,
-            mask_groups: config.mask_groups(),
+            mask_groups: masks.groups.iter().map(|(shape, _)| *shape).collect(),
             num_queries: config.final_queries,
             mask_queries: config.mask_queries,
             pow_bits: config.final_pow_bits,
@@ -485,9 +555,9 @@ where
         let mask_witnesses: Vec<MaskGroupWitness<'_, F, EF, MT>> = masks
             .groups
             .iter()
-            .map(|(width, data)| {
-                let range = group_offset..group_offset + width;
-                group_offset += width;
+            .map(|(shape, data)| {
+                let range = group_offset..group_offset + shape.width;
+                group_offset += shape.width;
                 MaskGroupWitness {
                     messages: &masks.messages[range.clone()],
                     randomness: &masks.randomness[range.clone()],
@@ -511,13 +581,12 @@ where
             rng,
         );
 
-        ZkWhirProof {
-            evals: claimed_evals,
+        Ok(ZkWhirRelationProof {
             sumchecks,
             sumcheck_mask_commitments,
             rounds,
             base_case,
-        }
+        })
     }
 
     /// Opens the active oracle at every index in one multiproof and folds

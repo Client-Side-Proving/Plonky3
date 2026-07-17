@@ -64,16 +64,24 @@ mod constraint;
 mod mask;
 mod proof;
 mod prover;
+mod relation;
 mod verifier;
 
 pub use adapter::HidingWhirPcs;
 pub use base_case::BaseCaseZkError;
 pub use code_switch::CodeSwitchError;
 pub use config::{ZkConfigError, ZkParameters, ZkWhirConfig};
+pub use constraint::{SourceClaim, SourceConstraint, SourceTerm};
 pub use mask::{MaskCodeShape, MaskGroupShape};
-pub use proof::{BaseCaseZkProof, BlindedMask, MaskOpeningPair, ZkRoundProof, ZkWhirProof};
-pub use prover::HidingWhirProverData;
-pub use verifier::ZkVerifierError;
+pub use proof::{
+    BaseCaseZkProof, BlindedMask, MaskOpeningPair, ZkRoundProof, ZkWhirProof, ZkWhirRelationProof,
+};
+pub use prover::{HidingWhirProver, HidingWhirProverData};
+pub use relation::{
+    CommittedMaskGroup, CommittedMaskGroupProverData, CommittedRelation, MaskGroupProverData,
+    RelationError,
+};
+pub use verifier::{HidingWhirVerifier, ZkVerifierError};
 
 #[cfg(test)]
 mod tests;

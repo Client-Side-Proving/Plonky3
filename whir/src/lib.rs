@@ -19,7 +19,9 @@ pub use pcs::prover::WhirProver;
 pub use pcs::verifier::WhirVerifier;
 pub use pcs::verifier::errors::VerifierError;
 pub use pcs::zk::{
-    BaseCaseZkError, BaseCaseZkProof, BlindedMask, CodeSwitchError, HidingWhirPcs,
-    HidingWhirProverData, MaskCodeShape, MaskGroupShape, MaskOpeningPair, ZkConfigError,
-    ZkParameters, ZkRoundProof, ZkVerifierError, ZkWhirConfig, ZkWhirProof,
+    BaseCaseZkError, BaseCaseZkProof, BlindedMask, CodeSwitchError, CommittedMaskGroup,
+    CommittedMaskGroupProverData, CommittedRelation, HidingWhirPcs, HidingWhirProver,
+    HidingWhirProverData, HidingWhirVerifier, MaskCodeShape, MaskGroupProverData, MaskGroupShape,
+    MaskOpeningPair, RelationError, SourceClaim, SourceConstraint, SourceTerm, ZkConfigError,
+    ZkParameters, ZkRoundProof, ZkVerifierError, ZkWhirConfig, ZkWhirProof, ZkWhirRelationProof,
 };

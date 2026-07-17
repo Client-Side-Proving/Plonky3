@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
-use p3_challenger::DuplexChallenger;
+use p3_challenger::{CanObserve, DuplexChallenger};
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::extension::BinomialExtensionField;
@@ -19,8 +19,11 @@ use rand::{RngExt, SeedableRng};
 use super::adapter::HidingWhirPcs;
 use super::base_case::BaseCaseZkError;
 use super::config::{ZkParameters, ZkWhirConfig};
-use super::proof::ZkWhirProof;
-use super::verifier::ZkVerifierError;
+use super::mask::{MaskCodeShape, MaskGroupShape};
+use super::proof::{ZkWhirProof, ZkWhirRelationProof};
+use super::prover::HidingWhirProver;
+use super::relation::{CommittedMaskGroup, CommittedRelation, RelationError};
+use super::verifier::{HidingWhirVerifier, ZkVerifierError};
 use crate::fiat_shamir::domain_separator::DomainSeparator;
 use crate::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption};
 use crate::pcs::proof::QueryOpenings;
@@ -214,6 +217,141 @@ fn separated_challenger(pcs: &TestZkPcs) -> MyChallenger {
     challenger
 }
 
+/// One direct committed-relation run, held open for verifier-side tampering.
+struct RelationProven {
+    pcs: TestZkPcs,
+    commitment: TestCommitment,
+    proof: ZkWhirRelationProof<F, EF, MyMmcs>,
+    relation: CommittedRelation<EF>,
+    masks: Vec<CommittedMaskGroup<EF, TestCommitment>>,
+}
+
+impl RelationProven {
+    fn verify(&self) -> Result<(), ZkVerifierError> {
+        let shapes = self
+            .masks
+            .iter()
+            .map(|group| group.shape)
+            .collect::<Vec<_>>();
+        let mut challenger = relation_separated_challenger(&self.pcs, &shapes);
+        challenger.observe(self.commitment.clone());
+        for group in &self.masks {
+            challenger.observe(group.commitment.clone());
+        }
+        HidingWhirVerifier::new(&self.pcs.config, &self.pcs.mmcs).verify_relation(
+            &self.proof,
+            &self.commitment,
+            self.relation.clone(),
+            self.masks.clone(),
+            &mut challenger,
+        )
+    }
+}
+
+fn relation_separated_challenger(pcs: &TestZkPcs, shapes: &[MaskGroupShape]) -> MyChallenger {
+    let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
+    let mut challenger = MyChallenger::new(perm);
+    let mut separator = DomainSeparator::new(vec![]);
+    separator.commit_statement_hvzk::<MyChallenger, 8>(&pcs.config.inner);
+    separator.add_zk_whir_relation_proof::<MyChallenger, 8>(&pcs.config, shapes);
+    separator.observe_domain_separator(&mut challenger);
+    challenger
+}
+
+fn prove_relation(seed: u64) -> RelationProven {
+    let pcs = Setup::new(seed).pcs();
+    let mut rng = SmallRng::seed_from_u64(seed.wrapping_add(1));
+    let witness = Poly::<F>::rand(&mut rng, pcs.config.num_variables);
+    let point = Point::rand(&mut rng, pcs.config.num_variables);
+    let shape = MaskGroupShape {
+        shape: MaskCodeShape::new(4, pcs.config.mask_queries, pcs.config.zk.mask_log_inv_rate),
+        width: 2,
+    };
+    let messages = (0..shape.width)
+        .map(|_| (0..shape.shape.message_len).map(|_| rng.random()).collect())
+        .collect::<Vec<Vec<EF>>>();
+    let mut challenger = relation_separated_challenger(&pcs, &[shape]);
+    let prover = HidingWhirProver::new(&pcs.config, &pcs.dft, &pcs.mmcs);
+    let (commitment, prover_data) = prover.commit(witness.clone(), &mut challenger, &mut rng);
+    let mut mask = prover
+        .commit_mask_group(shape, messages, &mut challenger, &mut rng)
+        .expect("well-formed mask group");
+    mask.covectors = vec![
+        vec![EF::ONE, EF::ZERO, EF::ONE, EF::ZERO],
+        vec![EF::ZERO, EF::ONE, EF::ZERO, EF::ONE],
+    ];
+
+    let mut relation = CommittedRelation::empty();
+    relation.source.push_eq(point.clone(), EF::ONE);
+    relation.target = witness.eval_base(&point) + mask.claim();
+    let masks = vec![CommittedMaskGroup {
+        shape,
+        commitment: mask.commitment.clone(),
+        covectors: mask.covectors.clone(),
+    }];
+    let proof = prover
+        .prove_relation(
+            prover_data,
+            &relation,
+            vec![mask],
+            &mut challenger,
+            &mut rng,
+        )
+        .expect("well-formed committed relation");
+
+    RelationProven {
+        pcs,
+        commitment,
+        proof,
+        relation,
+        masks,
+    }
+}
+
+#[test]
+fn zk_whir_committed_relation_round_trip() {
+    prove_relation(101)
+        .verify()
+        .expect("honest committed relation verifies");
+}
+
+#[test]
+fn zk_whir_committed_relation_rejects_wrong_target() {
+    let mut proven = prove_relation(102);
+    proven.relation.target += EF::ONE;
+    assert!(proven.verify().is_err());
+}
+
+#[test]
+fn zk_whir_committed_relation_rejects_wrong_covector() {
+    let mut proven = prove_relation(103);
+    proven.masks[0].covectors[0][0] += EF::ONE;
+    assert!(proven.verify().is_err());
+}
+
+#[test]
+fn zk_whir_committed_relation_rejects_wrong_mask_commitment() {
+    let mut proven = prove_relation(104);
+    proven.masks[0].commitment = proven.commitment.clone();
+    assert!(proven.verify().is_err());
+}
+
+#[test]
+fn zk_whir_committed_relation_rejects_bad_group_dimensions() {
+    let mut proven = prove_relation(105);
+    let _ = proven.masks[0].covectors[0].pop();
+    assert_eq!(
+        proven.verify(),
+        Err(ZkVerifierError::Relation(
+            RelationError::CovectorLengthMismatch {
+                mask: 0,
+                expected: 4,
+                actual: 3,
+            }
+        ))
+    );
+}
+
 #[test]
 fn zk_whir_end_to_end_single_round() {
     // One code-switching round: 12 vars, constant folding 4
@@ -283,9 +421,9 @@ fn zk_whir_code_switch_overhead_accounting() {
     );
 
     let proven = setup.prove();
-    assert_eq!(proven.proof.rounds.len(), pcs.config.n_rounds());
+    assert_eq!(proven.proof.relation.rounds.len(), pcs.config.n_rounds());
 
-    for (round, round_proof) in proven.proof.rounds.iter().enumerate() {
+    for (round, round_proof) in proven.proof.relation.rounds.iter().enumerate() {
         let t_ood = pcs.config.round_parameters[round].ood_samples;
         // Wire: exactly t_ood private OOD answers this round.
         assert_eq!(round_proof.ood_answers.len(), t_ood);
@@ -354,10 +492,11 @@ fn zk_whir_rejects_tampered_ood_answer() {
     // A shifted private OOD answer desynchronizes the carried claim.
     let mut proven = Setup::new(8).prove();
     assert!(
-        !proven.proof.rounds.is_empty() && !proven.proof.rounds[0].ood_answers.is_empty(),
+        !proven.proof.relation.rounds.is_empty()
+            && !proven.proof.relation.rounds[0].ood_answers.is_empty(),
         "fixture should produce at least one private OOD answer",
     );
-    proven.proof.rounds[0].ood_answers[0] += EF::ONE;
+    proven.proof.relation.rounds[0].ood_answers[0] += EF::ONE;
     let err = proven.verify().unwrap_err();
     // Diverged transcript: the verifier samples different STIR positions,
     // so the round-0 multiproof fails to authenticate.
@@ -368,7 +507,7 @@ fn zk_whir_rejects_tampered_ood_answer() {
 fn zk_whir_rejects_tampered_base_case_reveal() {
     // A shifted blinded message breaks the joint target identity.
     let mut proven = Setup::new(10).prove();
-    proven.proof.base_case.blinded_message[0] += EF::ONE;
+    proven.proof.relation.base_case.blinded_message[0] += EF::ONE;
     let err = proven.verify().unwrap_err();
     assert_eq!(
         err,
@@ -382,7 +521,7 @@ fn zk_whir_rejects_tampered_masked_claim() {
     //
     // Mutation: shift mu_g -> the joint target identity no longer closes.
     let mut proven = Setup::new(22).prove();
-    proven.proof.base_case.masked_claim += EF::ONE;
+    proven.proof.relation.base_case.masked_claim += EF::ONE;
     let err = proven.verify().unwrap_err();
     assert_eq!(
         err,
@@ -405,8 +544,13 @@ fn zk_whir_rejects_truncated_rounds() {
     //
     // Mutation: drop it -> 0 != 1 -> reject before any transcript work.
     let mut proven = Setup::new(13).prove();
-    let expected = proven.proof.rounds.len();
-    let _ = proven.proof.rounds.pop().expect("fixture has one round");
+    let expected = proven.proof.relation.rounds.len();
+    let _ = proven
+        .proof
+        .relation
+        .rounds
+        .pop()
+        .expect("fixture has one round");
     let err = proven.verify().unwrap_err();
     assert_eq!(
         err,
@@ -425,6 +569,7 @@ fn zk_whir_rejects_truncated_sumchecks() {
     let mut proven = Setup::new(14).prove();
     let _ = proven
         .proof
+        .relation
         .sumchecks
         .pop()
         .expect("fixture has two batches");
@@ -445,7 +590,7 @@ fn zk_whir_rejects_missing_ood_answer() {
     //     answers:      [y_1, ..., y_{t-1}]
     //     ood_samples:  t                    -> count mismatch -> reject
     let mut proven = Setup::new(15).prove();
-    let _ = proven.proof.rounds[0]
+    let _ = proven.proof.relation.rounds[0]
         .ood_answers
         .pop()
         .expect("fixture has OOD answers");
@@ -467,7 +612,7 @@ fn zk_whir_rejects_missing_query_opening() {
     // Openings are not absorbed, so the transcript matches up to the
     // count check itself.
     let mut proven = Setup::new(16).prove();
-    let dropped = match &mut proven.proof.rounds[0].openings {
+    let dropped = match &mut proven.proof.relation.rounds[0].openings {
         QueryOpenings::Base(opening) => opening.rows.pop().is_some(),
         QueryOpenings::Extension(opening) => opening.rows.pop().is_some(),
     };
@@ -507,7 +652,7 @@ fn zk_whir_rejects_tampered_pow_witness() {
     //
     // Mutation: shift the round's PoW witness -> the grind check fails.
     let mut proven = Setup::new(18).pow_bits(5).prove();
-    proven.proof.rounds[0].pow_witness += F::ONE;
+    proven.proof.relation.rounds[0].pow_witness += F::ONE;
     let err = proven.verify().unwrap_err();
     // The bad witness usually fails the grind; if it coincidentally still
     // satisfies it, the diverged transcript fails a later round-0 multiproof.
@@ -525,7 +670,7 @@ fn zk_whir_rejects_tampered_sumcheck_wire() {
     // The wire is absorbed, so the remaining transcript diverges and the
     // replayed batch cannot close.
     let mut proven = Setup::new(19).prove();
-    proven.proof.sumchecks[0].round_coefficients[0][0] += EF::ONE;
+    proven.proof.relation.sumchecks[0].round_coefficients[0][0] += EF::ONE;
     let err = proven.verify().unwrap_err();
     // Diverged transcript: the verifier samples different STIR positions,
     // so the round-0 multiproof fails to authenticate.
@@ -705,7 +850,7 @@ fn zk_whir_masks_are_witness_independent() {
     let proof_a = run(witness_a);
     let proof_b = run(witness_b);
     assert_ne!(
-        proof_a.base_case.blinded_message, proof_b.base_case.blinded_message,
+        proof_a.relation.base_case.blinded_message, proof_b.relation.base_case.blinded_message,
         "different witnesses produce different (uniformly padded) reveals",
     );
 }

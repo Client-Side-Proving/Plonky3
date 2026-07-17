@@ -17,6 +17,17 @@ use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 pub struct ZkWhirProof<F: Send + Sync + Clone, EF, MT: Mmcs<F>> {
     /// Claimed opening evaluations, one per requested point.
     pub evals: Vec<EF>,
+    /// Witness-hiding proof of the resulting committed relation.
+    pub relation: ZkWhirRelationProof<F, EF, MT>,
+}
+
+/// HVZK-WHIR proof for an already-bound committed relation.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(bound(
+    serialize = "F: Serialize, EF: Serialize, MT::Commitment: Serialize, MT::MultiProof: Serialize",
+    deserialize = "F: Deserialize<'de>, EF: Deserialize<'de>, MT::Commitment: Deserialize<'de>, MT::MultiProof: Deserialize<'de>"
+))]
+pub struct ZkWhirRelationProof<F: Send + Sync + Clone, EF, MT: Mmcs<F>> {
     /// Masked sumcheck transcripts, one per fold batch (`n_rounds + 1` batches).
     pub sumchecks: Vec<ZkSumcheckData<F, EF>>,
     /// Interleaved sumcheck mask commitment per fold batch.
