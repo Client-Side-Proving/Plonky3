@@ -26,6 +26,33 @@ where
     pub(crate) _marker: PhantomData<EF>,
 }
 
+impl<F, EF, MT> HidingWhirProverData<F, EF, MT>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F>,
+    MT: Mmcs<F>,
+{
+    /// Reconstructs the prover handoff for an existing hiding commitment.
+    ///
+    /// The caller is responsible for supplying the message, encoding
+    /// randomness, and Merkle prover data that produced the commitment being
+    /// opened. This is useful for reusable or serialized proving keys whose
+    /// storage format keeps those three components separately.
+    #[must_use]
+    pub const fn from_parts(
+        message: Poly<F>,
+        randomness: Vec<F>,
+        merkle: MT::ProverData<DenseMatrix<F>>,
+    ) -> Self {
+        Self {
+            message,
+            randomness,
+            merkle,
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// Merkle prover data of the active committed oracle.
 pub(super) enum ZkRoundData<F, EF, MT>
 where
