@@ -97,8 +97,8 @@ pub enum Observe {
     ZkSumcheckClaim,
     /// Fresh-side claim `mu_g` of the HVZK base case.
     ZkBaseCaseClaim,
-    /// Blinded one-time-pad reveals of the HVZK base case.
-    ZkBaseCaseReveal,
+    /// Merkle digest binding the blinded one-time-pad reveals of the HVZK base case.
+    ZkBaseCaseRevealDigest,
 }
 
 /// Sub-labels for hint (non-binding auxiliary) transcript items.

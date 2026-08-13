@@ -12,6 +12,7 @@ use p3_util::log2_strict_usize;
 
 use super::config::BaseCaseZkConfig;
 use super::error::BaseCaseZkError;
+use super::reveal_digest::reveal_digest;
 use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 use crate::pcs::utils::get_challenge_stir_queries;
 use crate::pcs::zk::proof::BaseCaseZkProof;
@@ -153,12 +154,12 @@ where
         }
         challenger.observe_algebra_element(proof.masked_claim);
         let gamma: EF = challenger.sample_algebra_element();
-        challenger.observe_algebra_slice(&proof.blinded_message);
-        challenger.observe_algebra_slice(&proof.blinded_randomness);
-        for blinded in &proof.blinded_masks {
-            challenger.observe_algebra_slice(&blinded.message);
-            challenger.observe_algebra_slice(&blinded.randomness);
-        }
+        challenger.observe(reveal_digest(
+            self.extension_mmcs,
+            &proof.blinded_message,
+            &proof.blinded_randomness,
+            &proof.blinded_masks,
+        ));
 
         // Check 2: the joint target identity.
         //

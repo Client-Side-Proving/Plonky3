@@ -35,7 +35,9 @@ use tracing::instrument;
 
 use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 use crate::pcs::utils::get_challenge_stir_queries;
-use crate::pcs::zk::base_case::{BaseCaseZkConfig, BaseCaseZkProver, MaskGroupWitness};
+use crate::pcs::zk::base_case::{
+    BaseCaseZkConfig, BaseCaseZkProver, MaskGroupWitness, MaskProverData,
+};
 use crate::pcs::zk::code_switch::{ZkMaskClaim, switch_mask_covector};
 use crate::pcs::zk::committer::{FoldedRsCode, zk_padded_matrix};
 use crate::pcs::zk::config::ZkWhirConfig;
@@ -51,7 +53,9 @@ pub struct HidingWhirProver<'a, EF, F, Dft, MT, Challenger>
 where
     F: TwoAdicField,
     EF: ExtensionField<F>,
-    MT: Mmcs<F>,
+    MT: Mmcs<F> + Send,
+    MT::Commitment: Send,
+    MaskProverData<F, EF, MT>: Send,
 {
     /// Derived HVZK configuration.
     pub config: &'a ZkWhirConfig<EF, F, Challenger>,
@@ -68,7 +72,9 @@ where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
-    MT: Mmcs<F>,
+    MT: Mmcs<F> + Send,
+    MT::Commitment: Send,
+    MaskProverData<F, EF, MT>: Send,
     Challenger: FieldChallenger<F>
         + GrindingChallenger<Witness = F>
         + CanSampleUniformBits<F>
@@ -219,7 +225,8 @@ where
             .constraints
             .iter()
             .all(|constraint| matches!(constraint.term, SourceTerm::Eq { .. }));
-        let product = if num_variables >= k_pack && all_eq {
+        let source_message = prover_data.message;
+        let product = if num_variables > k_pack && all_eq {
             let mut weights = Poly::<EF::ExtensionPacking>::zero(num_variables - k_pack);
             for constraint in &relation.source.constraints {
                 let SourceTerm::Eq { point } = &constraint.term else {
@@ -228,18 +235,11 @@ where
                 SplitEq::new_packed(point, constraint.coeff)
                     .accumulate_into_packed(weights.as_mut_slice(), None);
             }
-            let evals = Poly::new(
-                F::Packing::pack_slice(prover_data.message.as_slice())
-                    .par_iter()
-                    .map(|&p| EF::ExtensionPacking::from(p))
-                    .collect(),
-            );
-            ProductPolynomial::new_packed(VariableOrder::Prefix, evals, weights)
+            ProductPolynomial::new_base_packed(source_message, weights)
         } else {
             let weights = relation.source.materialize(num_variables);
             let evals = Poly::new(
-                prover_data
-                    .message
+                source_message
                     .as_slice()
                     .par_iter()
                     .map(|&v| v.into())

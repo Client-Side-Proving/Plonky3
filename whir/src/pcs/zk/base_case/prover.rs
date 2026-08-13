@@ -5,12 +5,14 @@ use alloc::vec::Vec;
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
 use p3_commit::{ExtensionMmcs, Mmcs};
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{ExtensionField, TwoAdicField, dot_product};
+use p3_field::{dot_product, ExtensionField, TwoAdicField};
+use p3_maybe_rayon::prelude::*;
 use p3_zk_codes::{ZkEncoding, ZkEncodingWithRandomness};
 use rand::distr::{Distribution, StandardUniform};
 use rand::{Rng, RngExt};
 
 use super::config::{BaseCaseZkConfig, MaskGroupWitness};
+use super::reveal_digest::reveal_digest;
 use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 use crate::pcs::utils::get_challenge_stir_queries;
 use crate::pcs::zk::proof::{BaseCaseZkProof, BlindedMask, MaskOpeningPair};
@@ -69,6 +71,9 @@ where
             + CanSampleUniformBits<F>
             + CanObserve<MT::Commitment>,
         R: Rng,
+        MT: Send,
+        MT::Commitment: Send,
+        super::config::MaskProverData<F, EF, MT>: Send,
     {
         let code = &self.config.code;
         // The witness must fit the agreed folded source code exactly.
@@ -103,23 +108,41 @@ where
         //                       ->  one root, one Merkle path per position
         let mut fresh_mask_commitments = Vec::with_capacity(masks.len());
         let mut fresh_groups = Vec::with_capacity(masks.len());
-        for (group, witness) in self.config.mask_groups.iter().zip(masks) {
-            // Every member of a group shares the group's code.
-            let encoding = group.shape.encoding::<EF>();
-            let mut blind_messages = Vec::with_capacity(group.width);
-            let mut blind_randomness = Vec::with_capacity(group.width);
-            for _ in 0..group.width {
-                // Uniform blind message s~'_i and fresh encoding
-                // randomness r'_i, retained for the reveals below.
-                let message = encoding.sample_message(rng);
-                let randomness = encoding.sample_randomness(rng);
-                blind_messages.push(message);
-                blind_randomness.push(randomness);
-            }
-            // Row z of the stacked matrix holds position z of every blind.
-            let (commitment, data) = self.extension_mmcs.commit_matrix(
-                encoding.encode_batch_with_randomness(&blind_messages, &blind_randomness),
-            );
+        let pending = self
+            .config
+            .mask_groups
+            .iter()
+            .map(|group| {
+                let encoding = group.shape.encoding::<EF>();
+                let mut blind_messages = Vec::with_capacity(group.width);
+                let mut blind_randomness = Vec::with_capacity(group.width);
+                for _ in 0..group.width {
+                    blind_messages.push(encoding.sample_message(rng));
+                    blind_randomness.push(encoding.sample_randomness(rng));
+                }
+                (
+                    *group,
+                    blind_messages,
+                    blind_randomness,
+                    (*self.extension_mmcs).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let committed = pending
+            .into_par_iter()
+            .map(
+                |(group, blind_messages, blind_randomness, extension_mmcs)| {
+                    let encoding = group.shape.encoding::<EF>();
+                    let (commitment, data) = extension_mmcs.commit_matrix(
+                        encoding.encode_batch_with_randomness(&blind_messages, &blind_randomness),
+                    );
+                    (commitment, data, blind_messages, blind_randomness)
+                },
+            )
+            .collect::<Vec<_>>();
+        for ((commitment, data, blind_messages, blind_randomness), witness) in
+            committed.into_iter().zip(masks)
+        {
             challenger.observe(commitment.clone());
             fresh_mask_commitments.push(commitment);
             fresh_groups.push((blind_messages, blind_randomness, data, witness));
@@ -161,8 +184,6 @@ where
         // Source reveals: f* = g~ + gamma * f and r* = r_g + gamma * r.
         let blinded_message = blind(&fresh_message, source_message);
         let blinded_randomness = blind(&fresh_randomness, source_randomness);
-        challenger.observe_algebra_slice(&blinded_message);
-        challenger.observe_algebra_slice(&blinded_randomness);
         // Mask reveals:
         // - xi*_i = s~'_i + gamma * xi_i,
         // - the analogous r*_i for each mask's encoding randomness.
@@ -173,16 +194,18 @@ where
                 .zip(blind_randomness)
                 .zip(witness.messages.iter().zip(witness.randomness))
             {
-                let blinded = BlindedMask {
+                blinded_masks.push(BlindedMask {
                     message: blind(message, hidden_message),
                     randomness: blind(randomness, hidden_randomness),
-                };
-                // Absorb each reveal before the spot positions are drawn.
-                challenger.observe_algebra_slice(&blinded.message);
-                challenger.observe_algebra_slice(&blinded.randomness);
-                blinded_masks.push(blinded);
+                });
             }
         }
+        challenger.observe(reveal_digest(
+            self.extension_mmcs,
+            &blinded_message,
+            &blinded_randomness,
+            &blinded_masks,
+        ));
 
         // PoW before the spot checks.
         //

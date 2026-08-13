@@ -28,7 +28,7 @@ use p3_util::log2_strict_usize;
 use tracing::instrument;
 
 use crate::constraints::Constraint;
-use crate::strategy::VariableOrder;
+use crate::strategy::{VariableOrder, sumcheck_coefficients_prefix};
 use crate::{SumcheckData, extrapolate_01inf};
 
 /// A paired representation of evaluation and weight polynomials for quadratic sumcheck.
@@ -74,6 +74,16 @@ use crate::{SumcheckData, extrapolate_01inf};
 /// SIMD efficiency threshold.
 #[derive(Debug, Clone)]
 enum MaybePacked<F: Field, EF: ExtensionField<F>> {
+    /// Base-field evaluations paired with packed extension-field weights.
+    ///
+    /// This transient representation avoids lifting an entire base-field table
+    /// before a prefix sumcheck. The first fold converts the evaluations
+    /// directly into the ordinary packed extension-field representation.
+    BasePacked {
+        evals: Poly<F>,
+        weights: Poly<EF::ExtensionPacking>,
+    },
+
     /// SIMD-packed representation for large polynomials.
     ///
     /// Each element in `evals` and `weights` is an `EF::ExtensionPacking`, which holds
@@ -136,6 +146,18 @@ pub struct ProductPolynomial<F: Field, EF: ExtensionField<F>> {
 }
 
 impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
+    /// Creates a prefix-binding product polynomial whose evaluations remain in
+    /// the base field until the first sumcheck fold.
+    pub fn new_base_packed(evals: Poly<F>, weights: Poly<EF::ExtensionPacking>) -> Self {
+        let k_pack = log2_strict_usize(F::Packing::WIDTH);
+        assert_eq!(evals.num_variables(), weights.num_variables() + k_pack);
+        assert!(evals.num_evals() > F::Packing::WIDTH);
+        Self {
+            inner: MaybePacked::BasePacked { evals, weights },
+            order: VariableOrder::Prefix,
+        }
+    }
+
     /// Creates a packed variant and runs an immediate transition check.
     ///
     /// # Arguments
@@ -195,6 +217,14 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// - **Small**: `stored_variables`
     pub fn num_variables(&self) -> usize {
         match &self.inner {
+            MaybePacked::BasePacked { evals, weights } => {
+                let k = evals.num_variables();
+                assert_eq!(
+                    k,
+                    weights.num_variables() + log2_strict_usize(F::Packing::WIDTH)
+                );
+                k
+            }
             MaybePacked::Packed { evals, weights } => {
                 // Get the number of variables in the packed representation.
                 let k = evals.num_variables();
@@ -220,6 +250,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// * `point` - The evaluation point as a [`Point`].
     pub fn eval(&self, point: &Point<EF>) -> EF {
         match &self.inner {
+            MaybePacked::BasePacked { evals, .. } => evals.eval_base::<EF>(point),
             MaybePacked::Packed { evals, .. } => evals.eval_packed(point),
             MaybePacked::Unpacked { evals, .. } => evals.eval_ext::<F>(point),
         }
@@ -247,7 +278,24 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     fn compress(&mut self, r: EF) {
         // Read the order once; the inner arms share the same dispatch target.
         let order = self.order;
+        if matches!(self.inner, MaybePacked::BasePacked { .. }) {
+            debug_assert_eq!(order, VariableOrder::Prefix);
+            let placeholder = MaybePacked::Unpacked {
+                evals: Poly::zero(0),
+                weights: Poly::zero(0),
+            };
+            let MaybePacked::BasePacked { evals, mut weights } =
+                core::mem::replace(&mut self.inner, placeholder)
+            else {
+                unreachable!();
+            };
+            let evals = evals.fix_prefix_var_to_packed::<EF>(r);
+            order.fix_var(&mut weights, r);
+            self.inner = MaybePacked::Packed { evals, weights };
+            return;
+        }
         match &mut self.inner {
+            MaybePacked::BasePacked { .. } => unreachable!(),
             // Apply folding to both packed polynomials.
             MaybePacked::Packed { evals, weights } => {
                 order.fix_var(evals, r);
@@ -340,6 +388,14 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
         // The strategy differs based on representation to maximize SIMD utilization.
         let order = self.order;
         let (c0, c_inf) = match &self.inner {
+            MaybePacked::BasePacked { evals, weights } => {
+                let evals = F::Packing::pack_slice(evals.as_slice());
+                let (c0, c_inf) = sumcheck_coefficients_prefix(evals, weights.as_slice());
+                (
+                    EF::ExtensionPacking::to_ext_iter([c0]).sum(),
+                    EF::ExtensionPacking::to_ext_iter([c_inf]).sum(),
+                )
+            }
             MaybePacked::Packed { evals, weights } => {
                 // Packed round coefficients: SIMD-parallel per-lane accumulation.
                 let (c0, c_inf) = order.sumcheck_coefficients(evals.as_slice(), weights.as_slice());
@@ -385,6 +441,14 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     pub(crate) fn round_coefficients(&self) -> (EF, EF) {
         let order = self.order;
         match &self.inner {
+            MaybePacked::BasePacked { evals, weights } => {
+                let evals = F::Packing::pack_slice(evals.as_slice());
+                let (c0, c_inf) = sumcheck_coefficients_prefix(evals, weights.as_slice());
+                (
+                    EF::ExtensionPacking::to_ext_iter([c0]).sum(),
+                    EF::ExtensionPacking::to_ext_iter([c_inf]).sum(),
+                )
+            }
             MaybePacked::Packed { evals, weights } => {
                 let (c0, c_inf) = order.sumcheck_coefficients(evals.as_slice(), weights.as_slice());
                 (
@@ -414,7 +478,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// - The combining challenge then lands on the constraint weights.
     pub(crate) fn scale_weights(&mut self, scale: EF) {
         match &mut self.inner {
-            MaybePacked::Packed { weights, .. } => {
+            MaybePacked::BasePacked { weights, .. } | MaybePacked::Packed { weights, .. } => {
                 for value in weights.as_mut_slice() {
                     *value *= scale;
                 }
@@ -438,7 +502,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     pub(crate) fn accumulate_weights(&mut self, delta: &[EF]) {
         assert_eq!(delta.len(), 1 << self.num_variables());
         match &mut self.inner {
-            MaybePacked::Packed { weights, .. } => {
+            MaybePacked::BasePacked { weights, .. } | MaybePacked::Packed { weights, .. } => {
                 let width = F::Packing::WIDTH;
                 for (value, chunk) in weights.as_mut_slice().iter_mut().zip(delta.chunks(width)) {
                     *value += EF::ExtensionPacking::from_ext_slice(chunk);
@@ -457,6 +521,9 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// No unpacking or copying takes place.
     pub fn evals_view(&self) -> PolyMaybePackedView<'_, F, EF> {
         match &self.inner {
+            MaybePacked::BasePacked { .. } => {
+                panic!("base-packed evaluations have no borrowed extension-field view")
+            }
             MaybePacked::Packed { evals, .. } => PolyMaybePacked::Packed(evals.as_view()),
             MaybePacked::Unpacked { evals, .. } => PolyMaybePacked::Scalar(evals.as_view()),
         }
@@ -471,6 +538,9 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// A copy of the evaluations in scalar extension field format.
     pub fn evals(&self) -> Poly<EF> {
         match &self.inner {
+            MaybePacked::BasePacked { evals, .. } => {
+                Poly::new(evals.as_slice().par_iter().copied().map(EF::from).collect())
+            }
             MaybePacked::Packed { evals, .. } => evals.unpack(),
             MaybePacked::Unpacked { evals, .. } => evals.clone(),
         }
@@ -485,7 +555,9 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// A copy of the weights in scalar extension field format.
     pub fn weights(&self) -> Poly<EF> {
         match &self.inner {
-            MaybePacked::Packed { weights, .. } => weights.unpack(),
+            MaybePacked::BasePacked { weights, .. } | MaybePacked::Packed { weights, .. } => {
+                weights.unpack()
+            }
             MaybePacked::Unpacked { weights, .. } => weights.clone(),
         }
     }
@@ -501,7 +573,7 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// * `constraint` - The constraint to combine into weights.
     pub fn combine(&mut self, sum: &mut EF, constraint: &Constraint<F, EF>) {
         match &mut self.inner {
-            MaybePacked::Packed { weights, .. } => {
+            MaybePacked::BasePacked { weights, .. } | MaybePacked::Packed { weights, .. } => {
                 constraint.combine_packed(weights, sum);
             }
             MaybePacked::Unpacked { weights, .. } => {
@@ -547,6 +619,11 @@ impl<F: Field, EF: ExtensionField<F>> ProductPolynomial<F, EF> {
     /// The dot product of `evals` and `weights`.
     pub fn dot_product(&self) -> EF {
         match &self.inner {
+            MaybePacked::BasePacked { evals, weights } => {
+                let evals = F::Packing::pack_slice(evals.as_slice());
+                let sum_packed = dot_product(weights.iter().copied(), evals.iter().copied());
+                EF::ExtensionPacking::to_ext_iter([sum_packed]).sum()
+            }
             MaybePacked::Packed { evals, weights } => {
                 // Compute packed dot product (SIMD parallel multiply-accumulate).
                 let sum_packed = dot_product(evals.iter().copied(), weights.iter().copied());
@@ -600,6 +677,52 @@ mod tests {
 
         // The logical number of variables should be 3 (since 2^3 = 8).
         assert_eq!(poly.num_variables(), 3);
+    }
+
+    #[test]
+    fn base_packed_first_round_matches_lifted_packed() {
+        type EP = <EF as ExtensionField<F>>::ExtensionPacking;
+
+        let width = <F as Field>::Packing::WIDTH;
+        let num_evals = width * 8;
+        let evals: Vec<F> = (0..num_evals)
+            .map(|i| F::from_u64((3 * i + 1) as u64))
+            .collect();
+        let weights: Vec<EF> = (0..num_evals)
+            .map(|i| EF::from_u64((5 * i + 2) as u64))
+            .collect();
+        let packed_weights = Poly::new(
+            weights
+                .chunks_exact(width)
+                .map(EP::from_ext_slice)
+                .collect(),
+        );
+        let packed_evals = Poly::new(
+            <F as Field>::Packing::pack_slice(&evals)
+                .iter()
+                .copied()
+                .map(EP::from)
+                .collect(),
+        );
+
+        let mut base =
+            ProductPolynomial::<F, EF>::new_base_packed(Poly::new(evals), packed_weights.clone());
+        let mut lifted = ProductPolynomial::<F, EF>::new_packed(
+            VariableOrder::Prefix,
+            packed_evals,
+            packed_weights,
+        );
+
+        assert_eq!(base.num_variables(), lifted.num_variables());
+        assert_eq!(base.dot_product(), lifted.dot_product());
+        assert_eq!(base.round_coefficients(), lifted.round_coefficients());
+
+        let challenge = EF::from_u64(17);
+        base.fold_round(challenge);
+        lifted.fold_round(challenge);
+        assert_eq!(base.evals(), lifted.evals());
+        assert_eq!(base.weights(), lifted.weights());
+        assert_eq!(base.dot_product(), lifted.dot_product());
     }
 
     #[test]
@@ -818,7 +941,7 @@ mod tests {
                 assert_eq!(packed_evals.num_evals(), expected_packed_len);
                 assert_eq!(packed_weights.num_evals(), expected_packed_len);
             }
-            MaybePacked::Unpacked { .. } => {
+            _ => {
                 panic!("Expected Packed variant initially");
             }
         }
@@ -838,7 +961,7 @@ mod tests {
                 assert_eq!(evals.num_evals(), simd_width);
                 assert_eq!(weights.num_evals(), simd_width);
             }
-            MaybePacked::Packed { .. } => {
+            _ => {
                 panic!("Expected Small variant after transition");
             }
         }
@@ -877,7 +1000,7 @@ mod tests {
                 assert_eq!(small_evals.as_slice(), &evals_scalar);
                 assert_eq!(small_weights.as_slice(), &weights_scalar);
             }
-            MaybePacked::Packed { .. } => {
+            _ => {
                 panic!("Expected Small variant after transition from single packed element");
             }
         }
@@ -1231,7 +1354,7 @@ mod tests {
                     evals: small_evals,
                     weights: small_weights,
                 } => sumcheck_coefficients_prefix(small_evals.as_slice(), small_weights.as_slice()),
-                MaybePacked::Packed { .. } => unreachable!(),
+                _ => unreachable!(),
             };
 
             // The sumcheck relation: h(0) + h(1) = claimed_sum

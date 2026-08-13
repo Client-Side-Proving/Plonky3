@@ -539,8 +539,6 @@ where
         let final_config = config.final_round_config();
         let folded_domain_size = final_config.domain_size >> final_config.folding_factor;
         let domain_size_bytes = ((folded_domain_size * 2 - 1).ilog2() as usize).div_ceil(8);
-        let randomness_len = config.oracle_randomness[config.n_rounds()];
-
         let mut mask_groups = external_mask_groups.to_vec();
         mask_groups.extend(config.mask_groups());
 
@@ -551,19 +549,8 @@ where
         }
         self.observe(1, Observe::ZkBaseCaseClaim);
         self.sample(1, Sample::CombinationRandomness);
-        // Blinded source reveal, then one blinded reveal per mask oracle.
-        self.observe(
-            (1 << final_config.num_variables) + randomness_len,
-            Observe::ZkBaseCaseReveal,
-        );
-        for group in &mask_groups {
-            for _ in 0..group.width {
-                self.observe(
-                    group.shape.message_len + group.shape.randomness_len,
-                    Observe::ZkBaseCaseReveal,
-                );
-            }
-        }
+        // One digest binds the fixed-shape source and mask reveal block.
+        self.observe(DIGEST_ELEMS, Observe::ZkBaseCaseRevealDigest);
 
         // Spot checks: source positions, then per-mask positions.
         self.pow(config.final_pow_bits);

@@ -25,7 +25,7 @@ use super::*;
 use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 use crate::pcs::zk::committer::FoldedRsCode;
 use crate::pcs::zk::mask::{MaskCodeShape, MaskGroupShape};
-use crate::pcs::zk::proof::BaseCaseZkProof;
+use crate::pcs::zk::proof::{BaseCaseZkProof, BlindedMask};
 
 type F = BabyBear;
 type EF = BinomialExtensionField<F, 4>;
@@ -333,6 +333,56 @@ fn base_case_rejects_tampered_mask_reveal() {
 }
 
 #[test]
+fn reveal_digest_binds_every_segment_and_mask_order() {
+    let (_, _, mmcs, _) = setup();
+    let message = vec![EF::from_u32(1), EF::from_u32(2), EF::from_u32(3)];
+    let randomness = vec![EF::from_u32(4), EF::from_u32(5)];
+    let masks = vec![
+        BlindedMask {
+            message: vec![EF::from_u32(6), EF::from_u32(7)],
+            randomness: vec![EF::from_u32(8)],
+        },
+        BlindedMask {
+            message: vec![EF::from_u32(9)],
+            randomness: vec![EF::from_u32(10), EF::from_u32(11)],
+        },
+    ];
+    let digest = |message: &[EF], randomness: &[EF], masks: &[BlindedMask<EF>]| {
+        postcard::to_allocvec(&super::reveal_digest::reveal_digest(
+            &mmcs, message, randomness, masks,
+        ))
+        .unwrap()
+    };
+    let expected = digest(&message, &randomness, &masks);
+
+    let mut changed_message = message.clone();
+    changed_message[0] += EF::ONE;
+    assert_ne!(digest(&changed_message, &randomness, &masks), expected);
+
+    let mut changed_randomness = randomness.clone();
+    changed_randomness[0] += EF::ONE;
+    assert_ne!(digest(&message, &changed_randomness, &masks), expected);
+
+    let mut changed_mask_message = masks.clone();
+    changed_mask_message[0].message[0] += EF::ONE;
+    assert_ne!(
+        digest(&message, &randomness, &changed_mask_message),
+        expected
+    );
+
+    let mut changed_mask_randomness = masks.clone();
+    changed_mask_randomness[1].randomness[0] += EF::ONE;
+    assert_ne!(
+        digest(&message, &randomness, &changed_mask_randomness),
+        expected
+    );
+
+    let mut reordered_masks = masks.clone();
+    reordered_masks.swap(0, 1);
+    assert_ne!(digest(&message, &randomness, &reordered_masks), expected);
+}
+
+#[test]
 fn base_case_rejects_unbound_source_reveal() {
     // The committed source encodes a shifted message; the reveals and
     // target keep the original.
@@ -374,7 +424,7 @@ fn base_case_rejects_unbound_mask_reveal() {
         err,
         BaseCaseZkError::MaskSpotCheckFailed {
             group: 0,
-            position: 3
+            position: 0
         }
     );
 }

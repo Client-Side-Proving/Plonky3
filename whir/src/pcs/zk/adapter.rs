@@ -13,6 +13,7 @@ use rand::rngs::StdRng;
 use rand::{CryptoRng, SeedableRng};
 use spin::Mutex;
 
+use super::base_case::MaskProverData;
 use super::config::ZkWhirConfig;
 use super::proof::ZkWhirProof;
 use super::prover::{HidingWhirProver, HidingWhirProverData};
@@ -109,7 +110,9 @@ where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
-    MT: Mmcs<F>,
+    MT: Mmcs<F> + Send,
+    MT::Commitment: Send,
+    MaskProverData<F, EF, MT>: Send,
     Challenger: FieldChallenger<F>
         + GrindingChallenger<Witness = F>
         + CanSampleUniformBits<F>

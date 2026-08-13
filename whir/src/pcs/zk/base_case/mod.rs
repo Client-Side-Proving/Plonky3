@@ -69,6 +69,7 @@
 mod config;
 mod error;
 mod prover;
+mod reveal_digest;
 mod verifier;
 
 pub use config::{BaseCaseZkConfig, MaskGroupWitness, MaskProverData};
