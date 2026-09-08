@@ -19,7 +19,7 @@ use rand::{RngExt, SeedableRng};
 use super::adapter::HidingWhirPcs;
 use super::base_case::BaseCaseZkError;
 use super::config::{ZkParameters, ZkWhirConfig};
-use super::mask::{MaskCodeShape, MaskGroupShape};
+use super::mask::{FreshMaskBatching, MaskCodeShape, MaskGroupShape};
 use super::proof::{ZkWhirProof, ZkWhirRelationProof};
 use super::prover::HidingWhirProver;
 use super::relation::{CommittedMaskGroup, CommittedRelation, RelationError};
@@ -64,6 +64,8 @@ struct Setup {
     soundness_type: SecurityAssumption,
     /// Grinding bits per round.
     pow_bits: usize,
+    /// Fresh-mask commitment grouping at the terminal base case.
+    fresh_mask_batching: FreshMaskBatching,
     /// Drives the PCS hiding randomness and the random statement.
     seed: u64,
 }
@@ -80,6 +82,7 @@ impl Setup {
             folding_factor: FoldingFactor::Constant(4),
             soundness_type: SecurityAssumption::CapacityBound,
             pow_bits: 0,
+            fresh_mask_batching: FreshMaskBatching::Separate,
             seed,
         }
     }
@@ -109,6 +112,11 @@ impl Setup {
         self
     }
 
+    const fn fresh_mask_batching(mut self, batching: FreshMaskBatching) -> Self {
+        self.fresh_mask_batching = batching;
+        self
+    }
+
     /// Builds the hiding PCS for this shape.
     fn pcs(&self) -> TestZkPcs {
         let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
@@ -128,7 +136,8 @@ impl Setup {
                 mask_log_inv_rate: 1,
             },
         )
-        .unwrap();
+        .unwrap()
+        .with_fresh_mask_batching(self.fresh_mask_batching);
         HidingWhirPcs::new(
             config,
             MyDft::default(),
@@ -854,4 +863,28 @@ fn zk_whir_masks_are_witness_independent() {
         proof_a.relation.base_case.blinded_message, proof_b.relation.base_case.blinded_message,
         "different witnesses produce different (uniformly padded) reveals",
     );
+}
+
+#[test]
+fn hiding_whir_same_height_fresh_batches_round_trip() {
+    for seed in 110..113 {
+        Setup::new(seed)
+            .num_variables(16)
+            .fresh_mask_batching(FreshMaskBatching::SameHeight)
+            .assert_round_trip();
+    }
+}
+
+#[test]
+fn hiding_whir_separator_binds_fresh_batching_mode() {
+    use p3_challenger::FieldChallenger;
+    let separate = Setup::new(110).pcs();
+    let batched = Setup::new(110)
+        .fresh_mask_batching(FreshMaskBatching::SameHeight)
+        .pcs();
+    let mut separate_challenger = separated_challenger(&separate);
+    let mut batched_challenger = separated_challenger(&batched);
+    let separate_challenge: EF = separate_challenger.sample_algebra_element();
+    let batched_challenge: EF = batched_challenger.sample_algebra_element();
+    assert_ne!(separate_challenge, batched_challenge);
 }

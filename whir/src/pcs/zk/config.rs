@@ -9,7 +9,7 @@ use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_util::log2_ceil_usize;
 use thiserror::Error;
 
-use super::mask::{MaskCodeShape, MaskGroupShape};
+use super::mask::{FreshMaskBatching, MaskCodeShape, MaskGroupShape};
 use crate::parameters::{ProtocolParameters, WhirConfig, WhirConfigError};
 
 /// Reasons ZK parameters cannot extend a WHIR configuration.
@@ -103,6 +103,8 @@ where
     pub switch_masks: Vec<MaskCodeShape>,
     /// Base-case spot checks per mask group, derived from `security_level`.
     pub mask_queries: usize,
+    /// Fresh-mask commitment grouping. The caller must bind this protocol choice.
+    pub fresh_mask_batching: FreshMaskBatching,
 }
 
 impl<EF, F, Challenger> Deref for ZkWhirConfig<EF, F, Challenger>
@@ -154,6 +156,9 @@ where
         //
         //     each mask spot-check branch is (1 - delta_zk)^{t_zk}
         //     union over the 2*n_rounds + 2 mask oracles -> + log2 of that
+        //     the union bound does not require independent groups; sharing a
+        //     uniform distinct query set across equal heights preserves each
+        //     group's marginal bound, so batching leaves this budget unchanged
         //     no PoW on mask spot checks -> target the full security level
         //     t_zk is also the mask randomness length -> t_zk-query private
         let union = log2_ceil_usize(2 * n_rounds + 2);
@@ -251,7 +256,18 @@ where
             sumcheck_mask,
             switch_masks,
             mask_queries,
+            fresh_mask_batching: FreshMaskBatching::Separate,
         })
+    }
+
+    /// Selects terminal fresh-mask batching without changing WHIR parameters.
+    ///
+    /// Callers must bind the selected mode into the authenticated protocol
+    /// configuration before any relation-dependent challenge is sampled.
+    #[must_use]
+    pub fn with_fresh_mask_batching(mut self, batching: FreshMaskBatching) -> Self {
+        self.fresh_mask_batching = batching;
+        self
     }
 
     /// Mask oracle groups in chronological commit order.

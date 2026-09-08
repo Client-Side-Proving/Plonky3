@@ -356,6 +356,7 @@ where
             final_config.domain_size >> final_config.folding_factor,
         );
         let base_config = BaseCaseZkConfig {
+            fresh_mask_batching: self.config.fresh_mask_batching,
             code: source_code,
             mask_groups: masks.groups,
             num_queries: config.final_queries,

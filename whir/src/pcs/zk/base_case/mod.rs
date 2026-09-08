@@ -57,7 +57,8 @@
 //! - Masks committed together form one interleaved oracle.
 //! - A group shares its evaluation domain, spot-check positions, and Merkle
 //!   paths.
-//! - The fresh blinds mirror that grouping.
+//! - Fresh blinds can additionally batch equal-height carried groups in one
+//!   wider matrix; all member codes and independent pads are preserved.
 //!
 //! # Source oracle abstraction
 //!

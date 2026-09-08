@@ -5,10 +5,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::slice::from_ref;
 
 use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
-use p3_challenger::DuplexChallenger;
+use p3_challenger::{CanObserve, DuplexChallenger, FieldChallenger};
 use p3_commit::{ExtensionMmcs, Mmcs};
 use p3_dft::Radix2DFTSmallBatch;
 use p3_field::extension::BinomialExtensionField;
@@ -24,7 +23,7 @@ use rand::{RngExt, SeedableRng};
 use super::*;
 use crate::pcs::proof::{QueryOpenings, SharedProofOpening};
 use crate::pcs::zk::committer::FoldedRsCode;
-use crate::pcs::zk::mask::{MaskCodeShape, MaskGroupShape};
+use crate::pcs::zk::mask::{FreshMaskBatching, MaskCodeShape, MaskGroupShape};
 use crate::pcs::zk::proof::{BaseCaseZkProof, BlindedMask};
 
 type F = BabyBear;
@@ -89,6 +88,37 @@ fn honest_run(
     <MyMmcs as Mmcs<F>>::Commitment,
     MyChallenger,
 ) {
+    honest_run_with_batching(
+        seed,
+        num_masks,
+        pow_bits,
+        tamper,
+        source_override,
+        FreshMaskBatching::Separate,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn honest_run_with_batching(
+    seed: u64,
+    num_masks: usize,
+    pow_bits: usize,
+    tamper: Tamper,
+    source_override: Option<Vec<EF>>,
+    batching: FreshMaskBatching,
+    groups_override: Option<Vec<MaskGroupShape>>,
+) -> (
+    BaseCaseZkConfig<F>,
+    ExtensionMmcs<F, EF, MyMmcs>,
+    BaseCaseZkProof<F, EF, MyMmcs>,
+    Vec<EF>,
+    Vec<Vec<EF>>,
+    Vec<<MyMmcs as Mmcs<F>>::Commitment>,
+    EF,
+    <MyMmcs as Mmcs<F>>::Commitment,
+    MyChallenger,
+) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let (mut prover_challenger, verifier_challenger, extension_mmcs, dft) = setup();
 
@@ -107,12 +137,14 @@ fn honest_run(
     let (source_commitment, source_data) = extension_mmcs.commit_matrix(source_codeword);
 
     // Carried masks as width-one groups with their own RS-ZK codes.
-    let mask_groups: Vec<MaskGroupShape> = (0..num_masks)
-        .map(|i| MaskGroupShape {
-            shape: MaskCodeShape::new(4 + i, 2, 1),
-            width: 1,
-        })
-        .collect();
+    let mask_groups: Vec<MaskGroupShape> = groups_override.unwrap_or_else(|| {
+        (0..num_masks)
+            .map(|i| MaskGroupShape {
+                shape: MaskCodeShape::new(4 + i, 2, 1),
+                width: 1,
+            })
+            .collect()
+    });
     let mut mask_messages = Vec::new();
     let mut mask_randomness = Vec::new();
     let mut mask_covectors = Vec::new();
@@ -120,20 +152,28 @@ fn honest_run(
     let mut mask_data = Vec::new();
     for (i, group) in mask_groups.iter().enumerate() {
         let encoding = group.shape.encoding::<EF>();
-        let message = encoding.sample_message(&mut rng);
-        let randomness = encoding.sample_randomness(&mut rng);
-        // Under MaskMessage the first committed mask encodes a shifted
-        // message, while the reveals and target keep the original.
-        let mut committed = message.clone();
-        if tamper == Tamper::MaskMessage && i == 0 {
-            committed[0] += EF::ONE;
+        let mut messages = Vec::new();
+        let mut randomness = Vec::new();
+        let mut committed = Vec::new();
+        for column in 0..group.width {
+            let message = encoding.sample_message(&mut rng);
+            randomness.push(encoding.sample_randomness(&mut rng));
+            let mut committed_message = message.clone();
+            if tamper == Tamper::MaskMessage && i == 0 && column == 0 {
+                committed_message[0] += EF::ONE;
+            }
+            committed.push(committed_message);
+            messages.push(message);
+            mask_covectors.push(
+                (0..group.shape.message_len)
+                    .map(|_| rng.random())
+                    .collect::<Vec<EF>>(),
+            );
         }
-        let codeword = encoding.encode_with_randomness(&committed, &randomness);
+        let codeword = encoding.encode_batch_with_randomness(&committed, &randomness);
         let (commitment, data) = extension_mmcs.commit_matrix(codeword);
-        let covector: Vec<EF> = (0..group.shape.message_len).map(|_| rng.random()).collect();
-        mask_messages.push(vec![message]);
-        mask_randomness.push(vec![randomness]);
-        mask_covectors.push(covector);
+        mask_messages.push(messages);
+        mask_randomness.push(randomness);
         mask_commitments.push(commitment);
         mask_data.push(data);
     }
@@ -144,11 +184,12 @@ fn honest_run(
         source_message.iter().copied(),
         source_covector.iter().copied(),
     );
-    for (messages, covector) in mask_messages.iter().zip(&mask_covectors) {
-        target += dot_product::<EF, _, _>(messages[0].iter().copied(), covector.iter().copied());
+    for (message, covector) in mask_messages.iter().flatten().zip(&mask_covectors) {
+        target += dot_product::<EF, _, _>(message.iter().copied(), covector.iter().copied());
     }
 
     let config = BaseCaseZkConfig {
+        fresh_mask_batching: batching,
         code,
         mask_groups,
         num_queries: 4,
@@ -160,19 +201,21 @@ fn honest_run(
         extension_mmcs: &extension_mmcs,
     };
 
+    let mut mask_offset = 0;
     let witnesses: Vec<MaskGroupWitness<'_, F, EF, MyMmcs>> = mask_messages
         .iter()
         .zip(&mask_randomness)
-        .zip(&mask_covectors)
         .zip(&mask_data)
-        .map(
-            |(((messages, randomness), covector), data)| MaskGroupWitness {
+        .map(|((messages, randomness), data)| {
+            let covectors = &mask_covectors[mask_offset..mask_offset + messages.len()];
+            mask_offset += messages.len();
+            MaskGroupWitness {
                 messages,
                 randomness,
-                covectors: from_ref(covector),
+                covectors,
                 data,
-            },
-        )
+            }
+        })
         .collect();
 
     let proof = prover.prove(
@@ -191,6 +234,44 @@ fn honest_run(
         &mut prover_challenger,
         &mut rng,
     );
+
+    if tamper == Tamper::None {
+        let mut checked_challenger = verifier_challenger.clone();
+        let verifier = BaseCaseZkVerifier {
+            config: &config,
+            extension_mmcs: &extension_mmcs,
+        };
+        verifier
+            .verify(
+                &proof,
+                &source_covector,
+                &mask_covectors,
+                &mask_commitments,
+                target,
+                |positions, opening| {
+                    let QueryOpenings::Extension(opening) = opening else {
+                        unreachable!()
+                    };
+                    opening
+                        .verify(
+                            &extension_mmcs,
+                            &source_commitment,
+                            &[Dimensions {
+                                height: config.code.domain_size,
+                                width: 1,
+                            }],
+                            positions,
+                        )
+                        .map_err(|_| BaseCaseZkError::SourceOpeningsRejected)?;
+                    Ok(opening.rows.iter().map(|row| row[0]).collect())
+                },
+                &mut checked_challenger,
+            )
+            .unwrap();
+        let prover_next: EF = prover_challenger.sample_algebra_element();
+        let verifier_next: EF = checked_challenger.sample_algebra_element();
+        assert_eq!(prover_next, verifier_next, "base-case transcript parity");
+    }
 
     (
         config,
@@ -475,4 +556,239 @@ fn base_case_reveals_are_one_time_padded() {
         let g_from_b = proof_b.blinded_message[i] - gamma * secret_b[i];
         assert_eq!(g_from_a, g_from_b, "recovered fresh mask differs at {i}");
     }
+}
+
+fn mixed_groups() -> Vec<MaskGroupShape> {
+    vec![
+        MaskGroupShape {
+            shape: MaskCodeShape::new(4, 2, 1),
+            width: 2,
+        },
+        MaskGroupShape {
+            shape: MaskCodeShape::new(7, 2, 1),
+            width: 1,
+        },
+        MaskGroupShape {
+            shape: MaskCodeShape::new(5, 2, 1),
+            width: 3,
+        },
+        MaskGroupShape {
+            shape: MaskCodeShape::new(4, 2, 1),
+            width: 1,
+        },
+    ]
+}
+
+#[test]
+fn fresh_batches_preserve_group_and_column_order() {
+    let groups = mixed_groups();
+    let batches = FreshMaskBatching::SameHeight.batches(&groups);
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].group_indices, vec![0, 2, 3]);
+    assert_eq!((batches[0].domain_size, batches[0].width), (16, 6));
+    assert_eq!(batches[1].group_indices, vec![1]);
+    assert_eq!((batches[1].domain_size, batches[1].width), (32, 1));
+    let separate = FreshMaskBatching::Separate.batches(&groups);
+    assert_eq!(separate.len(), 4);
+    for (index, batch) in separate.iter().enumerate() {
+        assert_eq!(batch.group_indices, vec![index]);
+        assert_eq!(batch.width, groups[index].width);
+    }
+}
+
+#[test]
+fn same_height_base_case_accepts_mixed_shapes_and_widths() {
+    for seed in 100..108 {
+        let (config, mmcs, proof, w, u, commits, target, source, challenger) =
+            honest_run_with_batching(
+                seed,
+                0,
+                0,
+                Tamper::None,
+                None,
+                FreshMaskBatching::SameHeight,
+                Some(mixed_groups()),
+            );
+        assert_eq!(proof.fresh_mask_commitments.len(), 2);
+        assert_eq!(proof.fresh_mask_openings.len(), 2);
+        assert_eq!(proof.carried_mask_openings.len(), 4);
+        assert_eq!(proof.fresh_mask_openings[0].rows[0].len(), 6);
+        assert!(
+            verify_run(
+                &config, &mmcs, &proof, &w, &u, &commits, target, &source, challenger
+            )
+            .is_ok()
+        );
+        let encoded = postcard::to_allocvec(&proof).unwrap();
+        let decoded: BaseCaseZkProof<F, EF, MyMmcs> = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(postcard::to_allocvec(&decoded).unwrap(), encoded);
+    }
+}
+
+#[test]
+fn same_height_base_case_rejects_distinct_malformed_payloads() {
+    let (config, mmcs, proof, w, u, commits, target, source, challenger) = honest_run_with_batching(
+        100,
+        0,
+        0,
+        Tamper::None,
+        None,
+        FreshMaskBatching::SameHeight,
+        Some(mixed_groups()),
+    );
+    let mut mutations = Vec::new();
+    let mut changed = proof.clone();
+    changed.fresh_mask_commitments[0] = proof.fresh_main_commitment.clone();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_commitments.swap(0, 1);
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_openings[0].rows[0][0] += EF::ONE;
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.carried_mask_openings[2].rows[0][0] += EF::ONE;
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_openings[0].rows[0].pop();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.carried_mask_openings[2].rows[0].pop();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_openings[0].rows.pop();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.carried_mask_openings[2].rows.pop();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_openings[0].proof.sibling_hashes[0][0] += F::ONE;
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.carried_mask_openings[2].proof.sibling_hashes[0][0] += F::ONE;
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.fresh_mask_openings.pop();
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.carried_mask_openings.swap(0, 2);
+    mutations.push(changed);
+    let mut changed = proof.clone();
+    changed.masked_claim += EF::ONE;
+    mutations.push(changed);
+    for (index, changed) in mutations.iter().enumerate() {
+        assert!(
+            verify_run(
+                &config,
+                &mmcs,
+                changed,
+                &w,
+                &u,
+                &commits,
+                target,
+                &source,
+                challenger.clone()
+            )
+            .is_err(),
+            "accepted mutation {index}"
+        );
+    }
+    let mut changed_commits = commits.clone();
+    changed_commits[2] = proof.fresh_mask_commitments[0].clone();
+    assert!(
+        verify_run(
+            &config,
+            &mmcs,
+            &proof,
+            &w,
+            &u,
+            &changed_commits,
+            target,
+            &source,
+            challenger.clone()
+        )
+        .is_err()
+    );
+    let mut changed_config = config.clone();
+    changed_config.mask_groups[2].width += 1;
+    assert!(
+        verify_run(
+            &changed_config,
+            &mmcs,
+            &proof,
+            &w,
+            &u,
+            &commits,
+            target,
+            &source,
+            challenger.clone()
+        )
+        .is_err()
+    );
+    let mut changed_config = config.clone();
+    changed_config.mask_groups.swap(1, 2);
+    assert!(
+        verify_run(
+            &changed_config,
+            &mmcs,
+            &proof,
+            &w,
+            &u,
+            &commits,
+            target,
+            &source,
+            challenger.clone()
+        )
+        .is_err()
+    );
+    let mut changed_config = config.clone();
+    changed_config.fresh_mask_batching = FreshMaskBatching::Separate;
+    assert!(
+        verify_run(
+            &changed_config,
+            &mmcs,
+            &proof,
+            &w,
+            &u,
+            &commits,
+            target,
+            &source,
+            challenger
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fresh_batch_roots_and_claim_bind_gamma() {
+    let (_, _, proof, ..) = honest_run_with_batching(
+        105,
+        0,
+        0,
+        Tamper::None,
+        None,
+        FreshMaskBatching::SameHeight,
+        Some(mixed_groups()),
+    );
+    let gamma = |proof: &BaseCaseZkProof<F, EF, MyMmcs>| -> EF {
+        let (mut challenger, ..) = setup();
+        challenger.observe(proof.fresh_main_commitment.clone());
+        for commitment in &proof.fresh_mask_commitments {
+            challenger.observe(commitment.clone());
+        }
+        challenger.observe_algebra_element(proof.masked_claim);
+        challenger.sample_algebra_element()
+    };
+    let expected = gamma(&proof);
+    for index in 0..proof.fresh_mask_commitments.len() {
+        let mut changed = proof.clone();
+        changed.fresh_mask_commitments[index] = proof.fresh_main_commitment.clone();
+        assert_ne!(gamma(&changed), expected);
+    }
+    let mut changed = proof.clone();
+    changed.fresh_mask_commitments.swap(0, 1);
+    assert_ne!(gamma(&changed), expected);
+    let mut changed = proof.clone();
+    changed.masked_claim += EF::ONE;
+    assert_ne!(gamma(&changed), expected);
 }

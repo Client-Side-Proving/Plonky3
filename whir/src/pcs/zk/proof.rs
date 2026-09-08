@@ -70,7 +70,7 @@ pub struct ZkRoundProof<F: Send + Sync + Clone, EF, MT: Mmcs<F>> {
 pub struct BaseCaseZkProof<F: Send + Sync + Clone, EF, MT: Mmcs<F>> {
     /// Commitment to the fresh main mask `g`, in the folded source code.
     pub fresh_main_commitment: MT::Commitment,
-    /// Commitments to the fresh blinds, one per carried mask group, in chronological group order.
+    /// Commitments to fresh blinds, in deterministic fresh-batch order.
     pub fresh_mask_commitments: Vec<MT::Commitment>,
     /// Fresh-side claim `mu_g = <g~, W> + sum_i <s~'_i, u_i>`.
     pub masked_claim: EF,
@@ -86,9 +86,11 @@ pub struct BaseCaseZkProof<F: Send + Sync + Clone, EF, MT: Mmcs<F>> {
     pub source_openings: QueryOpenings<F, EF, MT::MultiProof>,
     /// Spot-check openings of the fresh main mask `g` at the same positions.
     pub fresh_main_openings: SharedProofOpening<EF, MT::MultiProof>,
-    /// Per group: paired openings of the carried oracle and its fresh blind.
-    /// Each opened row spans the whole group.
-    pub mask_openings: Vec<MaskOpeningPair<EF, MT::MultiProof>>,
+    /// Openings of carried oracles, in chronological carried-group order.
+    pub carried_mask_openings: Vec<SharedProofOpening<EF, MT::MultiProof>>,
+    /// Openings of fresh blinds, in deterministic fresh-batch order.
+    /// Each row concatenates the batch's member groups in chronological order.
+    pub fresh_mask_openings: Vec<SharedProofOpening<EF, MT::MultiProof>>,
 }
 
 /// One mask oracle's blinded reveal.

@@ -7,7 +7,7 @@ use p3_field::{ExtensionField, TwoAdicField};
 use p3_matrix::dense::RowMajorMatrix;
 
 use crate::pcs::zk::committer::FoldedRsCode;
-use crate::pcs::zk::mask::MaskGroupShape;
+use crate::pcs::zk::mask::{FreshMaskBatching, MaskGroupShape};
 
 /// Shared base-case protocol shape.
 #[derive(Debug, Clone)]
@@ -16,6 +16,8 @@ pub struct BaseCaseZkConfig<F> {
     pub code: FoldedRsCode<F>,
     /// Carried mask oracle groups, in chronological commit order.
     pub mask_groups: Vec<MaskGroupShape>,
+    /// Deterministic grouping of fresh commitments and spot-check positions.
+    pub fresh_mask_batching: FreshMaskBatching,
     /// Spot checks against the source oracle.
     pub num_queries: usize,
     /// Spot checks per carried mask group.

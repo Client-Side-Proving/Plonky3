@@ -8,7 +8,7 @@ use p3_field::{ExtensionField, Field, TwoAdicField};
 
 use crate::fiat_shamir::pattern::{Hint, Observe, Pattern, Sample};
 use crate::parameters::{FoldingFactor, WhirConfig};
-use crate::pcs::zk::{MaskGroupShape, ZkWhirConfig};
+use crate::pcs::zk::{FreshMaskBatching, MaskGroupShape, ZkWhirConfig};
 
 /// Configuration for a sumcheck phase in the protocol.
 #[derive(Debug)]
@@ -495,6 +495,12 @@ where
             self.protocol_param(group.width);
         }
 
+        // Preserve the Separate separator exactly. The explicit candidate
+        // marker also distinguishes modes when all heights are unique.
+        if config.fresh_mask_batching == FreshMaskBatching::SameHeight {
+            self.protocol_param(1);
+        }
+
         // The evaluation adapter batches public claims here. A relation caller
         // has already bound its scalar target and source terms.
         if sample_initial_combination {
@@ -542,9 +548,10 @@ where
         let mut mask_groups = external_mask_groups.to_vec();
         mask_groups.extend(config.mask_groups());
 
-        // Fresh main mask plus one fresh blind group per carried mask group.
+        let fresh_batches = config.fresh_mask_batching.batches(&mask_groups);
+        // Fresh main mask plus one commitment per derived fresh batch.
         self.observe(DIGEST_ELEMS, Observe::MerkleDigest);
-        for _ in 0..mask_groups.len() {
+        for _ in 0..fresh_batches.len() {
             self.observe(DIGEST_ELEMS, Observe::MerkleDigest);
         }
         self.observe(1, Observe::ZkBaseCaseClaim);
@@ -560,8 +567,8 @@ where
         );
         self.hint(Hint::StirAnswers);
         self.hint(Hint::MerkleProof);
-        for group in &mask_groups {
-            let mask_bytes = ((group.shape.domain_size * 2 - 1).ilog2() as usize).div_ceil(8);
+        for batch in &fresh_batches {
+            let mask_bytes = ((batch.domain_size * 2 - 1).ilog2() as usize).div_ceil(8);
             self.sample(config.mask_queries * mask_bytes, Sample::StirQueries);
             self.hint(Hint::StirAnswers);
             self.hint(Hint::MerkleProof);

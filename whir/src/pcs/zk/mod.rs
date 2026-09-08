@@ -72,7 +72,7 @@ pub use base_case::BaseCaseZkError;
 pub use code_switch::CodeSwitchError;
 pub use config::{ZkConfigError, ZkParameters, ZkWhirConfig};
 pub use constraint::{SourceClaim, SourceConstraint, SourceTerm};
-pub use mask::{MaskCodeShape, MaskGroupShape};
+pub use mask::{FreshMaskBatch, FreshMaskBatching, MaskCodeShape, MaskGroupShape};
 pub use proof::{
     BaseCaseZkProof, BlindedMask, MaskOpeningPair, ZkRoundProof, ZkWhirProof, ZkWhirRelationProof,
 };

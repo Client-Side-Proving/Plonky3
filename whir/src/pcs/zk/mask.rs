@@ -3,10 +3,13 @@
 //! Code shapes and committed mask groups, shared by the configuration, the
 //! verifier replay, and the base case.
 
+use alloc::vec::Vec;
+
 use p3_dft::Radix2Dit;
 use p3_field::TwoAdicField;
 use p3_zk_codes::ReedSolomonZkEncoding;
 use rand::distr::{Distribution, StandardUniform};
+use serde::{Deserialize, Serialize};
 
 /// Shape of one small mask code: a Reed-Solomon ZK encoding over `EF`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,4 +64,59 @@ pub struct MaskGroupShape {
     pub shape: MaskCodeShape,
     /// Number of stacked masks.
     pub width: usize,
+}
+
+/// Fresh-mask commitment grouping at the terminal hiding base case.
+///
+/// This changes the proof schema and transcript, while preserving every
+/// carried mask's code, independently sampled blind, and query count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshMaskBatching {
+    /// Commit and query each fresh group separately.
+    #[default]
+    Separate,
+    /// Concatenate fresh groups with equal domain sizes into one matrix.
+    SameHeight,
+}
+
+/// Deterministically derived fresh-mask commitment geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshMaskBatch {
+    /// Height shared by every member's encoded matrix.
+    pub domain_size: usize,
+    /// Total number of extension-field columns in the combined matrix.
+    pub width: usize,
+    /// Carried-group indices, in chronological order.
+    pub group_indices: Vec<usize>,
+}
+
+impl FreshMaskBatching {
+    /// Derives batches in order of first carried-group occurrence.
+    ///
+    /// Members and their columns remain in chronological order. Group
+    /// mappings are derived from validated configuration, never from a proof.
+    #[must_use]
+    pub fn batches(self, groups: &[MaskGroupShape]) -> Vec<FreshMaskBatch> {
+        let mut batches: Vec<FreshMaskBatch> = Vec::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            let existing = if self == Self::SameHeight {
+                batches
+                    .iter_mut()
+                    .find(|batch| batch.domain_size == group.shape.domain_size)
+            } else {
+                None
+            };
+            if let Some(batch) = existing {
+                batch.width += group.width;
+                batch.group_indices.push(group_index);
+            } else {
+                batches.push(FreshMaskBatch {
+                    domain_size: group.shape.domain_size,
+                    width: group.width,
+                    group_indices: alloc::vec![group_index],
+                });
+            }
+        }
+        batches
+    }
 }

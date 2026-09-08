@@ -76,6 +76,10 @@ where
     {
         let code = &self.config.code;
         let num_groups = self.config.mask_groups.len();
+        let batches = self
+            .config
+            .fresh_mask_batching
+            .batches(&self.config.mask_groups);
         // Total carried masks: the groups tile the flat mask list.
         let num_masks: usize = self
             .config
@@ -102,7 +106,9 @@ where
         count(mask_commitments.len(), num_groups)?;
         count(source_covector.len(), code.message_len)?;
         count(proof.blinded_masks.len(), num_masks)?;
-        count(proof.fresh_mask_commitments.len(), num_groups)?;
+        count(proof.fresh_mask_commitments.len(), batches.len())?;
+        count(proof.carried_mask_openings.len(), num_groups)?;
+        count(proof.fresh_mask_openings.len(), batches.len())?;
         // Per-mask reveal and covector lengths against the group's code.
         let blinded = |kind, actual: usize, expected: usize| {
             if actual == expected {
@@ -238,72 +244,82 @@ where
             }
         }
 
-        // Check 5: mask spot checks at t_zk positions per group.
-        //
-        // Same equation as check 4, per group member i and position y:
-        //
-        //     Enc(xi*_i, r*_i)(y) = s'_i(y) + gamma * xi_i(y)
-        //
-        // Positions are shared across a group: one opened row of each
-        // oracle serves every member.
-        openings("mask", proof.mask_openings.len(), num_groups)?;
-        let mut mask_offset = 0;
-        for (group_index, (group, pair)) in self
+        // Check 5: authenticate each combined fresh oracle once and each
+        // carried root separately at the batch's shared distinct positions.
+        let mut next_offset = 0;
+        let mask_offsets = self
             .config
             .mask_groups
             .iter()
-            .zip(&proof.mask_openings)
-            .enumerate()
-        {
+            .map(|group| {
+                let offset = next_offset;
+                next_offset += group.width;
+                offset
+            })
+            .collect::<Vec<_>>();
+        for (batch_index, batch) in batches.iter().enumerate() {
             let positions = get_challenge_stir_queries::<Challenger, F>(
-                group.shape.domain_size,
+                batch.domain_size,
                 0,
                 self.config.mask_queries,
                 challenger,
             );
-            let dims = vec![Dimensions {
-                height: group.shape.domain_size,
-                width: group.width,
+            let fresh_dims = [Dimensions {
+                height: batch.domain_size,
+                width: batch.width,
             }];
-            // xi_i(y) for every member i: rows of the carried oracle.
-            let carried_rows = self.verify_rows(
-                &mask_commitments[group_index],
-                &dims,
-                &positions,
-                &pair.carried,
-                group.width,
-                "carried mask",
-            )?;
-            // s'_i(y) for every member i: rows of the fresh blind.
             let fresh_rows = self.verify_rows(
-                &proof.fresh_mask_commitments[group_index],
-                &dims,
+                &proof.fresh_mask_commitments[batch_index],
+                &fresh_dims,
                 &positions,
-                &pair.fresh,
-                group.width,
+                &proof.fresh_mask_openings[batch_index],
+                batch.width,
                 "fresh mask",
             )?;
-            // Evaluation domain of the mask code over the extension field.
-            let mask_gen = EF::two_adic_generator(log2_strict_usize(group.shape.domain_size));
-            let blinded = &proof.blinded_masks[mask_offset..mask_offset + group.width];
-            for ((&position, carried_row), fresh_row) in
-                positions.iter().zip(carried_rows).zip(fresh_rows)
-            {
-                // The field point behind position y.
-                let point = mask_gen.exp_u64(position as u64);
-                for ((blinded, &carried), &fresh) in blinded.iter().zip(carried_row).zip(fresh_row)
+            let mask_gen = EF::two_adic_generator(log2_strict_usize(batch.domain_size));
+            let points = positions
+                .iter()
+                .map(|&position| mask_gen.exp_u64(position as u64))
+                .collect::<Vec<_>>();
+            let mut fresh_offset = 0;
+            for &group_index in &batch.group_indices {
+                let group = &self.config.mask_groups[group_index];
+                let dims = [Dimensions {
+                    height: group.shape.domain_size,
+                    width: group.width,
+                }];
+                let carried_rows = self.verify_rows(
+                    &mask_commitments[group_index],
+                    &dims,
+                    &positions,
+                    &proof.carried_mask_openings[group_index],
+                    group.width,
+                    "carried mask",
+                )?;
+                let offset = mask_offsets[group_index];
+                let blinded = &proof.blinded_masks[offset..offset + group.width];
+                for (((&position, &point), carried_row), fresh_row) in positions
+                    .iter()
+                    .zip(&points)
+                    .zip(carried_rows)
+                    .zip(fresh_rows)
                 {
-                    // Enc(xi*_i, r*_i)(y): re-encode member i's reveal.
-                    let blinded_value = padded_ood_t1(point, &blinded.message, &blinded.randomness);
-                    if blinded_value != fresh + gamma * carried {
-                        return Err(BaseCaseZkError::MaskSpotCheckFailed {
-                            group: group_index,
-                            position,
-                        });
+                    let fresh_members = &fresh_row[fresh_offset..fresh_offset + group.width];
+                    for ((blinded, &carried), &fresh) in
+                        blinded.iter().zip(carried_row).zip(fresh_members)
+                    {
+                        let blinded_value =
+                            padded_ood_t1(point, &blinded.message, &blinded.randomness);
+                        if blinded_value != fresh + gamma * carried {
+                            return Err(BaseCaseZkError::MaskSpotCheckFailed {
+                                group: group_index,
+                                position,
+                            });
+                        }
                     }
                 }
+                fresh_offset += group.width;
             }
-            mask_offset += group.width;
         }
 
         Ok(())
