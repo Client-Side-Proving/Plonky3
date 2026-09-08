@@ -105,6 +105,8 @@ where
     pub mask_queries: usize,
     /// Fresh-mask commitment grouping. The caller must bind this protocol choice.
     pub fresh_mask_batching: FreshMaskBatching,
+    /// Concatenate each sumcheck batch into one physical mask codeword.
+    pub pack_sumcheck_masks: bool,
 }
 
 impl<EF, F, Challenger> Deref for ZkWhirConfig<EF, F, Challenger>
@@ -257,6 +259,7 @@ where
             switch_masks,
             mask_queries,
             fresh_mask_batching: FreshMaskBatching::Separate,
+            pack_sumcheck_masks: false,
         })
     }
 
@@ -270,25 +273,59 @@ where
         self
     }
 
+    /// Selects physical mask packing. This choice is transcript-bound.
+    #[must_use]
+    pub fn with_sumcheck_mask_packing(mut self, packed: bool) -> Result<Self, ZkConfigError> {
+        if packed {
+            for batch in 0..=self.n_rounds() {
+                let message_len = self
+                    .zk
+                    .ell_zk
+                    .saturating_mul(self.round_folding_factor(batch));
+                let log_domain_size =
+                    log2_ceil_usize(message_len.saturating_add(self.mask_queries))
+                        + self.zk.mask_log_inv_rate;
+                if log_domain_size > EF::TWO_ADICITY {
+                    return Err(ZkConfigError::MaskDomainExceedsTwoAdicity {
+                        log_domain_size,
+                        two_adicity: EF::TWO_ADICITY,
+                    });
+                }
+            }
+        }
+        self.pack_sumcheck_masks = packed;
+        Ok(self)
+    }
+
+    /// Physical shape of a batch of independent logical sumcheck masks.
+    #[must_use]
+    pub fn sumcheck_mask_group(&self, folding: usize) -> MaskGroupShape {
+        if self.pack_sumcheck_masks {
+            MaskGroupShape {
+                shape: self.sumcheck_mask.packed(folding),
+                width: 1,
+            }
+        } else {
+            MaskGroupShape {
+                shape: self.sumcheck_mask,
+                width: folding,
+            }
+        }
+    }
+
     /// Mask oracle groups in chronological commit order.
     ///
     /// One `k`-wide group per fold batch, one width-one group per round.
     #[must_use]
     pub fn mask_groups(&self) -> Vec<MaskGroupShape> {
         let mut groups = Vec::with_capacity(2 * self.n_rounds() + 1);
-        groups.push(MaskGroupShape {
-            shape: self.sumcheck_mask,
-            width: self.round_folding_factor(0),
-        });
+        groups.push(self.sumcheck_mask_group(self.round_folding_factor(0)));
         for round in 0..self.n_rounds() {
             groups.push(MaskGroupShape {
                 shape: self.switch_masks[round],
                 width: 1,
             });
-            groups.push(MaskGroupShape {
-                shape: self.sumcheck_mask,
-                width: self.round_folding_factor(round + 1),
-            });
+            groups.push(self.sumcheck_mask_group(self.round_folding_factor(round + 1)));
         }
         groups
     }

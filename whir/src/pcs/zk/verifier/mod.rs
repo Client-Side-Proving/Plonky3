@@ -435,7 +435,8 @@ where
             folding,
             ell_zk,
             &handoff.randomness,
-            self.config.sumcheck_mask,
+            self.config.sumcheck_mask_group(folding),
+            self.config.pack_sumcheck_masks,
             commitment.clone(),
         );
 

@@ -74,18 +74,27 @@ where
         folding: usize,
         ell_zk: usize,
         randomness: &Point<EF>,
-        shape: MaskCodeShape,
+        group: MaskGroupShape,
+        packed: bool,
         commitment: MT::Commitment,
     ) {
         self.claims.absorb_sumcheck(eps, folding);
         let gammas: Vec<EF> = randomness.iter().copied().collect();
-        for covector in mask_residual_covectors_from_shape(folding, ell_zk, &gammas) {
+        // A one-round batch has width one in both modes. The authenticated
+        // configuration selects the representation; geometry only checks it.
+        assert_eq!(group.width, if packed { 1 } else { folding });
+        assert_eq!(
+            group.shape.message_len,
+            ell_zk * if packed { folding } else { 1 }
+        );
+        let mut covectors = mask_residual_covectors_from_shape(folding, ell_zk, &gammas);
+        if packed {
+            covectors = alloc::vec![covectors.into_iter().flatten().collect()];
+        }
+        for covector in covectors {
             self.claims.push(covector);
         }
-        self.groups.push(MaskGroupShape {
-            shape,
-            width: folding,
-        });
+        self.groups.push(group);
         self.commitments.push(commitment);
     }
 

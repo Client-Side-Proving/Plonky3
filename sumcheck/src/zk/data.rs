@@ -116,12 +116,16 @@ where
     /// These are prover-only witnesses. Code-switch composition uses them to
     /// carry the verifier-visible masked residual as auxiliary linear claims.
     pub mask_messages: Vec<Vec<EF>>,
-    /// Encoding randomness used for each mask, in round order.
+    /// Encoding randomness used for each physical committed column.
+    ///
+    /// Unpacked batches have one vector per logical round. Packed batches have
+    /// one vector for the concatenation of all logical mask messages.
     ///
     /// Prover-only. The HVZK base case reveals blinded combinations
     /// `r* = r' + gamma * r`, which requires the raw values.
     pub mask_randomness: Vec<Vec<EF>>,
-    /// The batch's interleaved mask oracle: one commitment, `k` columns.
+    /// One commitment to the physical mask oracle: `k` columns when unpacked,
+    /// or one column containing the concatenated message when packed.
     pub mask_oracle: MaskOracle<EF, M>,
 }
 

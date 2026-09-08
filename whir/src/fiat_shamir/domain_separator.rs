@@ -495,8 +495,23 @@ where
             self.protocol_param(group.width);
         }
 
-        // Preserve the Separate separator exactly. The explicit candidate
-        // marker also distinguishes modes when all heights are unique.
+        // The preceding external-group count fixes exactly four parameter
+        // entries per group, so group dimensions equal to 1 or 2 cannot be
+        // parsed as mode markers. After those entries the mode grammar is:
+        //
+        //   []     unpacked / Separate
+        //   [2]    packed   / Separate
+        //   [1]    unpacked / SameHeight
+        //   [2, 1] packed   / SameHeight
+        //
+        // Each listed value is a complete (ProtocolParam marker, value) pair.
+        // The following Sample or ZkSumcheckClaim operation has a different
+        // tag/label and terminates this optional block unambiguously. Keeping
+        // the empty block preserves the unpacked / Separate transcript;
+        // explicit markers distinguish modes even when their geometry agrees.
+        if config.pack_sumcheck_masks {
+            self.protocol_param(2);
+        }
         if config.fresh_mask_batching == FreshMaskBatching::SameHeight {
             self.protocol_param(1);
         }
@@ -657,5 +672,70 @@ mod tests {
                 .contains(&observe_entry(2, Observe::ZkSumcheckPoly)),
             "ell_zk < 3 still sends max(ell_zk, 3) - 1 wire coefficients",
         );
+    }
+
+    #[test]
+    fn zk_mask_mode_markers_follow_counted_external_groups() {
+        use p3_baby_bear::Poseidon2BabyBear;
+        use p3_challenger::DuplexChallenger;
+        use p3_field::PrimeCharacteristicRing;
+
+        use crate::parameters::{ProtocolParameters, SecurityAssumption};
+        use crate::pcs::zk::ZkParameters;
+
+        type Ch = DuplexChallenger<F, Poseidon2BabyBear<16>, 16, 8>;
+        let base = ZkWhirConfig::<EF, F, Ch>::new(
+            8,
+            ProtocolParameters {
+                security_level: 32,
+                pow_bits: 0,
+                starting_log_inv_rate: 2,
+                round_log_inv_rates: vec![],
+                folding_factor: FoldingFactor::Constant(1),
+                soundness_type: SecurityAssumption::CapacityBound,
+            },
+            ZkParameters {
+                ell_zk: 4,
+                mask_log_inv_rate: 1,
+            },
+        )
+        .unwrap();
+        let marker = observe_entry(0, Observe::ProtocolParam);
+        for group_count in 0..=2 {
+            // Width values deliberately match the optional mode-marker values.
+            let groups: Vec<_> = (0..group_count)
+                .map(|index| MaskGroupShape {
+                    shape: base.sumcheck_mask,
+                    width: index + 1,
+                })
+                .collect();
+            let mode_offset = 2 * (3 + base.oracle_randomness.len() + 1 + 4 * group_count);
+            for packed in [false, true] {
+                for batching in [FreshMaskBatching::Separate, FreshMaskBatching::SameHeight] {
+                    let config = base
+                        .clone()
+                        .with_sumcheck_mask_packing(packed)
+                        .unwrap()
+                        .with_fresh_mask_batching(batching);
+                    let mut separator = DomainSeparator::<EF, F>::new(vec![]);
+                    separator.add_zk_whir_relation_proof::<Ch, 8>(&config, &groups);
+                    let mut expected = vec![];
+                    if packed {
+                        expected.extend([marker, F::from_usize(2)]);
+                    }
+                    if batching == FreshMaskBatching::SameHeight {
+                        expected.extend([marker, F::from_usize(1)]);
+                    }
+                    assert_eq!(
+                        &separator.pattern[mode_offset..mode_offset + expected.len()],
+                        &expected
+                    );
+                    assert_eq!(
+                        separator.pattern[mode_offset + expected.len()],
+                        observe_entry(1, Observe::ZkSumcheckClaim)
+                    );
+                }
+            }
+        }
     }
 }

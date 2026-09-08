@@ -34,6 +34,24 @@ impl MaskCodeShape {
         }
     }
 
+    /// Concatenates independently sampled logical messages into one codeword,
+    /// preserving the original inverse-rate bound and query-randomness budget.
+    #[must_use]
+    pub fn packed(self, width: usize) -> Self {
+        assert!(width > 0);
+        let logical_degree_bound = (self.message_len + self.randomness_len).next_power_of_two();
+        assert!(self.domain_size.is_power_of_two());
+        assert!(self.domain_size >= logical_degree_bound);
+        let log_inv_rate = (self.domain_size / logical_degree_bound).ilog2() as usize;
+        Self::new(
+            self.message_len
+                .checked_mul(width)
+                .expect("mask width overflow"),
+            self.randomness_len,
+            log_inv_rate,
+        )
+    }
+
     /// Instantiates the encoding over the extension field.
     ///
     /// Mask codewords are tiny, so a fresh radix-2 DIT per call is free.

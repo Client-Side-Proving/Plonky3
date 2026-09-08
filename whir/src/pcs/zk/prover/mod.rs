@@ -251,9 +251,14 @@ where
 
         // Initial masked sumcheck batch.
         let mut zk_data = ZkSumcheckData::default();
-        let handoff = sumcheck_prover.into_zk_sumcheck(
+        let handoff = sumcheck_prover.into_zk_sumcheck_with_mask_packing(
             &mut zk_data,
             &sumcheck_mask_encoding,
+            &config
+                .sumcheck_mask_group(config.round_folding_factor(0))
+                .shape
+                .encoding::<EF>(),
+            config.pack_sumcheck_masks,
             &self.extension_mmcs,
             config.round_folding_factor(0),
             config.starting_folding_pow_bits,
@@ -271,7 +276,8 @@ where
             &mut sumcheck_mask_commitments,
             handoff,
             &mut zk_data,
-            config.sumcheck_mask,
+            config.sumcheck_mask_group(config.round_folding_factor(0)),
+            config.pack_sumcheck_masks,
         );
 
         // Current oracle state: message randomness folds along with the
@@ -506,9 +512,14 @@ where
             // The mask-claim total rides the batch as its auxiliary constant.
             let aux = masks.aux;
             let mut zk_data = ZkSumcheckData::default();
-            let handoff = sumcheck_prover.into_zk_sumcheck(
+            let handoff = sumcheck_prover.into_zk_sumcheck_with_mask_packing(
                 &mut zk_data,
                 &sumcheck_mask_encoding,
+                &config
+                    .sumcheck_mask_group(folding_next)
+                    .shape
+                    .encoding::<EF>(),
+                config.pack_sumcheck_masks,
                 &self.extension_mmcs,
                 folding_next,
                 round_params.folding_pow_bits,
@@ -521,7 +532,8 @@ where
                 &mut sumcheck_mask_commitments,
                 handoff,
                 &mut zk_data,
-                config.sumcheck_mask,
+                config.sumcheck_mask_group(folding_next),
+                config.pack_sumcheck_masks,
             );
 
             oracle_randomness =

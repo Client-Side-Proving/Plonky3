@@ -57,7 +57,7 @@ where
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     #[tracing::instrument(skip_all)]
     pub fn into_zk_sumcheck<Enc, M, R, Ch>(
-        mut self,
+        self,
         zk_data: &mut ZkSumcheckData<F, EF>,
         encoding: &Enc,
         mmcs: &M,
@@ -70,6 +70,49 @@ where
     where
         Enc: ZkEncodingWithRandomness<EF>,
         Enc::Codeword: Matrix<EF>,
+        M: Mmcs<EF>,
+        R: Rng,
+        Ch: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanObserve<M::Commitment>,
+    {
+        self.into_zk_sumcheck_with_mask_packing(
+            zk_data,
+            encoding,
+            encoding,
+            false,
+            mmcs,
+            folding_factor,
+            pow_bits,
+            aux_claim,
+            challenger,
+            rng,
+        )
+    }
+
+    /// Commits independent per-round masks as one concatenated physical codeword.
+    ///
+    /// The logical encoding defines each round's mask coefficients. When packed,
+    /// the commitment encoding has `folding_factor * message_len` coefficients
+    /// and its own query-hiding randomness budget. The caller must bind this
+    /// choice and the physical geometry before entering the sumcheck.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn into_zk_sumcheck_with_mask_packing<Enc, PhysicalEnc, M, R, Ch>(
+        mut self,
+        zk_data: &mut ZkSumcheckData<F, EF>,
+        encoding: &Enc,
+        commitment_encoding: &PhysicalEnc,
+        packed: bool,
+        mmcs: &M,
+        folding_factor: usize,
+        pow_bits: usize,
+        aux_claim: EF,
+        challenger: &mut Ch,
+        rng: &mut R,
+    ) -> ZkSumcheckHandoff<F, EF, M>
+    where
+        Enc: ZkEncodingWithRandomness<EF>,
+        Enc::Codeword: Matrix<EF>,
+        PhysicalEnc: ZkEncodingWithRandomness<EF>,
+        PhysicalEnc::Codeword: Matrix<EF>,
         M: Mmcs<EF>,
         R: Rng,
         Ch: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanObserve<M::Commitment>,
@@ -93,8 +136,23 @@ where
         // The bound value is the joint claim, matching the verifier's view.
         challenger.observe_algebra_element(self.claimed_sum() + aux_claim);
 
-        let (masks, mask_randomness, mask_oracle) =
-            sample_masks::<EF, _, _, _, _>(folding_factor, encoding, mmcs, challenger, rng);
+        let (masks, mask_randomness, mask_oracle) = if packed {
+            assert_eq!(commitment_encoding.message_len(), ell_zk * folding_factor);
+            // Keep the original independent logical draws. Packing changes only
+            // their commitment coordinates and the encoding's random padding.
+            let masks: Vec<Vec<EF>> = (0..folding_factor)
+                .map(|_| encoding.sample_message(rng))
+                .collect();
+            let messages: Vec<Vec<EF>> = alloc::vec![masks.iter().flatten().copied().collect()];
+            let randomness = alloc::vec![commitment_encoding.sample_randomness(rng)];
+            let oracle = mmcs.commit_matrix(
+                commitment_encoding.encode_batch_with_randomness(&messages, &randomness),
+            );
+            challenger.observe(oracle.0.clone());
+            (masks, randomness, oracle)
+        } else {
+            sample_masks::<EF, _, _, _, _>(folding_factor, encoding, mmcs, challenger, rng)
+        };
         let mut sum_future_endpoints = observe_masks_and_mu_tilde::<F, EF, _>(
             &masks,
             folding_factor,

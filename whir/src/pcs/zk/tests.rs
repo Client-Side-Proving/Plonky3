@@ -66,6 +66,7 @@ struct Setup {
     pow_bits: usize,
     /// Fresh-mask commitment grouping at the terminal base case.
     fresh_mask_batching: FreshMaskBatching,
+    pack_sumcheck_masks: bool,
     /// Drives the PCS hiding randomness and the random statement.
     seed: u64,
 }
@@ -83,6 +84,7 @@ impl Setup {
             soundness_type: SecurityAssumption::CapacityBound,
             pow_bits: 0,
             fresh_mask_batching: FreshMaskBatching::Separate,
+            pack_sumcheck_masks: false,
             seed,
         }
     }
@@ -117,6 +119,11 @@ impl Setup {
         self
     }
 
+    fn packed_masks(mut self) -> Self {
+        self.pack_sumcheck_masks = true;
+        self
+    }
+
     /// Builds the hiding PCS for this shape.
     fn pcs(&self) -> TestZkPcs {
         let perm = Perm::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
@@ -137,7 +144,9 @@ impl Setup {
             },
         )
         .unwrap()
-        .with_fresh_mask_batching(self.fresh_mask_batching);
+        .with_fresh_mask_batching(self.fresh_mask_batching)
+        .with_sumcheck_mask_packing(self.pack_sumcheck_masks)
+        .unwrap();
         HidingWhirPcs::new(
             config,
             MyDft::default(),
@@ -887,4 +896,53 @@ fn hiding_whir_separator_binds_fresh_batching_mode() {
     let separate_challenge: EF = separate_challenger.sample_algebra_element();
     let batched_challenge: EF = batched_challenger.sample_algebra_element();
     assert_ne!(separate_challenge, batched_challenge);
+}
+
+#[test]
+fn hiding_whir_packed_masks_round_trip_and_binding() {
+    use p3_challenger::FieldChallenger;
+    for (variables, folding) in [(8, 1), (12, 3), (16, 4)] {
+        let setup = || {
+            Setup::new(271)
+                .num_variables(variables)
+                .folding_factor(FoldingFactor::Constant(folding))
+                .fresh_mask_batching(FreshMaskBatching::SameHeight)
+        };
+        setup().packed_masks().assert_round_trip();
+        let off = setup().pcs();
+        let packed = setup().packed_masks().pcs();
+        assert!(
+            packed
+                .config
+                .mask_groups()
+                .iter()
+                .all(|group| group.width == 1)
+        );
+        assert_ne!(
+            separated_challenger(&off).sample_algebra_element::<EF>(),
+            separated_challenger(&packed).sample_algebra_element::<EF>()
+        );
+    }
+}
+
+#[test]
+fn hiding_whir_one_round_mask_packing_is_explicit() {
+    let setup = || {
+        Setup::new(913)
+            .num_variables(8)
+            .folding_factor(FoldingFactor::Constant(1))
+            .fresh_mask_batching(FreshMaskBatching::SameHeight)
+    };
+    let off = setup().pcs();
+    let mut packed = setup().packed_masks().prove();
+    // Every sumcheck stage has one logical mask, so its physical geometry
+    // cannot identify whether packing is enabled.
+    assert_eq!(off.config.mask_groups(), packed.pcs.config.mask_groups());
+    packed.verify().expect("packed one-round batches verify");
+    setup().assert_round_trip();
+    packed.pcs.config.pack_sumcheck_masks = false;
+    assert!(
+        packed.verify().is_err(),
+        "equal geometry must not permit mode substitution"
+    );
 }

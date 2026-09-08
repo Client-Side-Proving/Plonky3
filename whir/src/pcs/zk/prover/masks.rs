@@ -103,7 +103,8 @@ where
         mask_commitments: &mut Vec<MT::Commitment>,
         mut handoff: ZkSumcheckHandoff<F, EF, ExtensionMmcs<F, EF, MT>>,
         zk_data: &mut ZkSumcheckData<F, EF>,
-        shape: MaskCodeShape,
+        group: MaskGroupShape,
+        packed: bool,
     ) -> BatchState<F, EF>
     where
         F: Send + Sync,
@@ -119,25 +120,29 @@ where
         // Claim side, fresh masks: mask j enters at scale one with the
         // power covector pow(gamma_j), its residual at the round challenge.
         let gammas: Vec<EF> = handoff.randomness.iter().copied().collect();
-        for (covector, message) in
-            mask_residual_covectors_from_shape(folding, shape.message_len, &gammas)
-                .into_iter()
-                .zip(&handoff.mask_messages)
-        {
+        let ell_zk = handoff.mask_messages[0].len();
+        // A one-round batch has width one in both modes. The authenticated
+        // configuration selects the representation; geometry only checks it.
+        assert_eq!(group.width, if packed { 1 } else { folding });
+        assert_eq!(
+            group.shape.message_len,
+            ell_zk * if packed { folding } else { 1 }
+        );
+        let mut covectors = mask_residual_covectors_from_shape(folding, ell_zk, &gammas);
+        if packed {
+            covectors = alloc::vec![covectors.into_iter().flatten().collect()];
+            handoff.mask_messages =
+                alloc::vec![handoff.mask_messages.into_iter().flatten().collect()];
+        }
+        assert_eq!(handoff.mask_messages.len(), group.width);
+        assert_eq!(handoff.mask_randomness.len(), group.width);
+        for (covector, message) in covectors.into_iter().zip(&handoff.mask_messages) {
             self.aux += dot_product::<EF, _, _>(covector.iter().copied(), message.iter().copied());
             self.claims.push(covector);
         }
-        // Retain the secrets behind the new oracle for the base-case
-        // reveals, plus its Merkle handle for the spot-check openings.
         self.messages.append(&mut handoff.mask_messages);
         self.randomness.append(&mut handoff.mask_randomness);
-        self.groups.push((
-            MaskGroupShape {
-                shape,
-                width: folding,
-            },
-            handoff.mask_oracle.1,
-        ));
+        self.groups.push((group, handoff.mask_oracle.1));
 
         BatchState {
             residual_prover: handoff.residual_prover,
