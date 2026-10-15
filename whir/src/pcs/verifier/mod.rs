@@ -158,7 +158,7 @@ where
             // The query openings form the selection group.
             // The challenge sampled here matches the prover's, weighting the groups
             // by its successive powers so both sides combine the claims identically.
-            let constraint = Constraint::new(
+            let constraint = Constraint::new_continuation(
                 challenger.sample_algebra_element(),
                 new_commitment.ood_statement.num_variables(),
                 vec![

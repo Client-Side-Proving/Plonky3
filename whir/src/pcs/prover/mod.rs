@@ -295,7 +295,7 @@ where
         // A freshly sampled challenge weights the groups by its successive powers,
         // and the verifier samples the same challenge to rebuild the identical batch.
         let num_variables = ood_statement.num_variables();
-        let constraint = Constraint::new(
+        let constraint = Constraint::new_continuation(
             challenger.sample_algebra_element(),
             num_variables,
             vec![

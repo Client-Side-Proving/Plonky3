@@ -216,6 +216,9 @@ pub struct Constraint<F: Field, EF: ExtensionField<F>> {
 
     /// Batching challenge whose powers weight each constraint.
     challenge: EF,
+
+    /// First exponent assigned to a fresh constraint in this batch.
+    first_power: usize,
 }
 
 impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
@@ -250,7 +253,25 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
             num_variables,
             statements,
             challenge,
+            first_power: 0,
         }
+    }
+
+    /// Builds fresh constraints to append to a carried claim of coefficient one.
+    ///
+    /// The first fresh constraint receives `challenge`, followed by its higher
+    /// powers. Reserving exponent zero for the carried claim prevents its error
+    /// from cancelling identically against a fresh, prover-chosen evaluation.
+    /// The caller must bind the fresh evaluations before sampling `challenge`.
+    #[must_use]
+    pub fn new_continuation(
+        challenge: EF,
+        num_variables: usize,
+        statements: Vec<Statements<F, EF>>,
+    ) -> Self {
+        let mut result = Self::new(challenge, num_variables, statements);
+        result.first_power = 1;
+        result
     }
 
     /// Returns the shared number of variables.
@@ -273,11 +294,11 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     ///
     /// # Arguments
     ///
-    /// - `shift`: exponent of the first power yielded.
+    /// - `shift`: offset within this batch, after its reserved initial powers.
     pub fn challenge_powers(&self, shift: usize) -> impl Iterator<Item = EF> {
-        // Seed the power sequence at the challenge raised to the requested offset.
+        // Final weight evaluation must use the same offset as scalar batching.
         self.challenge
-            .shifted_powers(self.challenge.exp_u64(shift as u64))
+            .shifted_powers(self.challenge.exp_u64((self.first_power + shift) as u64))
     }
 
     /// Accumulates the challenge-weighted expected value across all groups.
@@ -291,7 +312,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// Each group starts at the power just after the previous group's last constraint.
     pub fn combine_evals(&self, eval: &mut EF) {
         // Running exponent of the next challenge power to assign.
-        let mut shift = 0;
+        let mut shift = self.first_power;
         for statement in &self.statements {
             // Fold this group's expected values starting at the current exponent.
             statement.combine_evals(eval, self.challenge, shift);
@@ -313,7 +334,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// - `eval`: scalar accumulator for the expected value.
     pub fn combine(&self, combined: &mut Poly<EF>, eval: &mut EF) {
         // Running exponent of the next challenge power to assign.
-        let mut shift = 0;
+        let mut shift = self.first_power;
         // Treat the incoming accumulator as already holding data, so every group adds onto it.
         let mut initialized = true;
         for statement in &self.statements {
@@ -332,7 +353,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// - `eval`: scalar accumulator for the expected value.
     pub fn combine_packed(&self, combined: &mut Poly<EF::ExtensionPacking>, eval: &mut EF) {
         // Running exponent of the next challenge power to assign.
-        let mut shift = 0;
+        let mut shift = self.first_power;
         // Treat the incoming accumulator as already holding data, so every group adds onto it.
         let mut initialized = true;
         for statement in &self.statements {
@@ -356,7 +377,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
         let mut eval = EF::ZERO;
 
         // Running exponent of the next challenge power to assign.
-        let mut shift = 0;
+        let mut shift = self.first_power;
         // The accumulator starts empty, so the first nonempty group may overwrite instead of add.
         let mut initialized = false;
         for statement in &self.statements {
@@ -386,7 +407,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
         let mut eval = EF::ZERO;
 
         // Running exponent of the next challenge power to assign.
-        let mut shift = 0;
+        let mut shift = self.first_power;
         // The accumulator starts empty, so the first nonempty group may overwrite instead of add.
         let mut initialized = false;
         for statement in &self.statements {
@@ -423,6 +444,83 @@ mod tests {
 
     /// Type alias for the extension field used in tests
     type EF = BinomialExtensionField<F, 4>;
+
+    #[test]
+    fn continuation_keeps_carried_and_fresh_errors_separate() {
+        let error = EF::from_u64(7);
+        for gamma in [EF::ZERO, EF::ONE, EF::TWO, EF::from_u64(13)] {
+            let statements = vec![Statements::Eq(EqStatement::new_hypercube(
+                vec![Point::new(vec![EF::ZERO])],
+                vec![-error],
+            ))];
+            let mut initial = error;
+            Constraint::<F, EF>::new(gamma, 1, statements.clone()).combine_evals(&mut initial);
+            assert_eq!(initial, EF::ZERO);
+
+            let mut continued = error;
+            Constraint::<F, EF>::new_continuation(gamma, 1, statements)
+                .combine_evals(&mut continued);
+            assert_eq!(continued, error * (EF::ONE - gamma));
+            assert_eq!(continued == EF::ZERO, gamma == EF::ONE);
+        }
+    }
+
+    #[test]
+    fn continuation_weights_match_scalar_packed_and_final_evaluation() {
+        let n = 7;
+        let gamma = EF::from_u64(3);
+        let point = Point::new((1..=n).map(|i| EF::from_usize(i)).collect());
+        let statements = vec![
+            Statements::Eq(EqStatement::new_hypercube(
+                vec![point.clone()],
+                vec![EF::from_u64(5)],
+            )),
+            Statements::Select(SelectStatement::new(
+                n,
+                vec![F::from_u64(2), F::from_u64(4)],
+                vec![EF::from_u64(7), EF::from_u64(11)],
+            )),
+        ];
+        let initial = Constraint::<F, EF>::new(gamma, n, statements.clone());
+        let continued = Constraint::<F, EF>::new_continuation(gamma, n, statements);
+        let (initial_weights, initial_eval) = initial.combine_new();
+        let (weights, eval) = continued.combine_new();
+        assert_eq!(eval, gamma * initial_eval);
+        assert_eq!(
+            eval,
+            gamma * EF::from_u64(5)
+                + gamma.square() * EF::from_u64(7)
+                + gamma.exp_u64(3) * EF::from_u64(11)
+        );
+        for (&actual, &before) in weights.iter().zip(initial_weights.iter()) {
+            assert_eq!(actual, gamma * before);
+        }
+        let (packed, packed_eval) = continued.combine_new_packed();
+        assert_eq!(packed.unpack::<F, EF>().as_slice(), weights.as_slice());
+        assert_eq!(packed_eval, eval);
+
+        let mut scalar = initial_weights.clone();
+        let mut accumulated_eval = initial_eval;
+        continued.combine(&mut scalar, &mut accumulated_eval);
+        let mut packed = initial_weights.pack::<F, EF>();
+        let mut accumulated_packed_eval = initial_eval;
+        continued.combine_packed(&mut packed, &mut accumulated_packed_eval);
+        assert_eq!(packed.unpack::<F, EF>().as_slice(), scalar.as_slice());
+        assert_eq!(accumulated_packed_eval, initial_eval + eval);
+        assert_eq!(accumulated_eval, initial_eval + eval);
+        let mut scalar_eval = initial_eval;
+        continued.combine_evals(&mut scalar_eval);
+        assert_eq!(scalar_eval, accumulated_eval);
+
+        for order in [VariableOrder::Prefix, VariableOrder::Suffix] {
+            let expected = order.eval_constraints_poly(&[initial.clone()], &point) * gamma;
+            assert_eq!(
+                order.eval_constraints_poly(&[continued.clone()], &point),
+                expected
+            );
+        }
+        assert_eq!(continued.challenge_powers(2).next(), Some(gamma.exp_u64(3)));
+    }
 
     #[test]
     fn test_constraint_new() {

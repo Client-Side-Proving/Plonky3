@@ -107,6 +107,9 @@ const COUNT_BITS: u32 = 16;
 /// Number of bits allotted to the `sub_label` component of an encoded entry.
 const LABEL_BITS: u32 = 8;
 
+/// Plain WHIR continuation batching reserves coefficient one for the carried claim.
+const PLAIN_CONTINUATION_VERSION: usize = 1;
+
 /// Packs a pattern tag, sub-label, and count into one field element using
 /// disjoint bit ranges, so that distinct `(tag, label, count)` triples
 /// always produce distinct field elements.
@@ -214,6 +217,7 @@ where
         &mut self,
         config: &WhirConfig<EF, F, Challenger>,
     ) {
+        self.protocol_param(PLAIN_CONTINUATION_VERSION);
         self.bind_config_params(config);
         self.observe(DIGEST_ELEMS, Observe::MerkleDigest);
         self.add_ood(config.commitment_ood_samples);
@@ -629,6 +633,41 @@ mod tests {
 
     fn sample_entry(count: usize, sample: Sample) -> F {
         encode_entry::<F>(Pattern::Sample, sample as u8, count)
+    }
+
+    #[test]
+    fn plain_commitment_binds_continuation_version_once() {
+        use p3_baby_bear::Poseidon2BabyBear;
+        use p3_challenger::DuplexChallenger;
+        use p3_field::PrimeCharacteristicRing;
+
+        use crate::parameters::{ProtocolParameters, SecurityAssumption};
+
+        type Ch = DuplexChallenger<F, Poseidon2BabyBear<16>, 16, 8>;
+        let config = WhirConfig::<EF, F, Ch>::new(
+            8,
+            ProtocolParameters {
+                security_level: 32,
+                pow_bits: 0,
+                starting_log_inv_rate: 2,
+                round_log_inv_rates: vec![],
+                folding_factor: FoldingFactor::Constant(1),
+                soundness_type: SecurityAssumption::CapacityBound,
+            },
+        )
+        .unwrap();
+        let mut plain = DomainSeparator::<EF, F>::new(Vec::new());
+        plain.commit_statement::<Ch, 8>(&config);
+        let mut hiding = DomainSeparator::<EF, F>::new(Vec::new());
+        hiding.commit_statement_hvzk::<Ch, 8>(&config);
+        assert_eq!(plain.pattern[0], observe_entry(0, Observe::ProtocolParam));
+        assert_eq!(plain.pattern[1], F::from_usize(PLAIN_CONTINUATION_VERSION));
+        // The shared configuration and commitment follow exactly one version entry.
+        assert_eq!(
+            &plain.pattern[2..2 + hiding.pattern.len()],
+            hiding.pattern.as_slice()
+        );
+        assert_eq!(plain.pattern.len(), hiding.pattern.len() + 4);
     }
 
     #[test]
